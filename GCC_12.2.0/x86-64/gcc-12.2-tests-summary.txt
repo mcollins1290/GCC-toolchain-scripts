@@ -1,0 +1,29 @@
+[H[2J[3J[36m=== ./gcc/gcc.sum ===[0m
+KIND           COUNT
+  PASS:        [32m 176825[0m
+  FAIL:        [31m      0[0m
+  XPASS:       [33m      0[0m
+  XFAIL:       [33m   1387[0m
+  UNSUPPORTED: [34m   2364[0m
+  UNRESOLVED:  [31m      0[0m
+
+[36m=== ./g++/g++.sum ===[0m
+KIND           COUNT
+  PASS:        [32m 229976[0m
+  FAIL:        [31m      4[0m
+  XPASS:       [33m      4[0m
+  XFAIL:       [33m   2069[0m
+  UNSUPPORTED: [34m   9913[0m
+  UNRESOLVED:  [31m      0[0m
+
+
+[35m=== TOTAL ACROSS ALL SUITES ===[0m
+KIND           COUNT
+  PASS:        [32m 406801[0m
+  FAIL:        [31m      4[0m
+  XPASS:       [33m      4[0m
+  XFAIL:       [33m   3456[0m
+  UNSUPPORTED: [34m  12277[0m
+  UNRESOLVED:  [31m      0[0m
+
+Progress (approx): [########################################] 100%  (410265 / 410265 counted tests)
