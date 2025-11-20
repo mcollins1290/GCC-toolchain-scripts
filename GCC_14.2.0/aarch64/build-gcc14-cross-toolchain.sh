@@ -332,7 +332,7 @@ build_gcc_final_cross() {
             --with-sysroot="${SYSROOT}" \
             --disable-multilib \
             --disable-nls \
-            --enable-languages=c,c++ \
+            --enable-languages=c,ada,c++,go,d,fortran,objc,obj-c++,m2,rust \
             --enable-shared \
             --enable-threads=posix \
             --enable-__cxa_atexit \
