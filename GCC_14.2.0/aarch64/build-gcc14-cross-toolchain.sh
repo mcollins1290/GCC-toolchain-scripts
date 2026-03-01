@@ -1,413 +1,382 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
-########################################################################
-# Configuration
-########################################################################
+# ==============================================================================
+# GCC cross toolchain builder
+# Target: aarch64-linux-gnu
+# Sysroot: external (e.g. Raspberry Pi rootfs)
+# ==============================================================================
 
-# Versions
-GCC_VER=14.2.0
-BINUTILS_VER=2.44
-GLIBC_VER=2.41
-LINUX_VER=6.1.21
-LINUX_MAINLINE_VER=6.1
+###############################################################################
+# Script Metadata
+###############################################################################
+SCRIPT_VERSION="v0.0.4"
 
-# Triplet & paths
-TARGET=aarch64-linux-gnu
-PREFIX=/opt/gcc-14-cross
-SYSROOT="${PREFIX}/${TARGET}-sysroot"
+# ------------------------------ User config -----------------------------------
+TARGET="${TARGET:-aarch64-linux-gnu}"
+PREFIX="${PREFIX:-/opt/gcc-14.2.0-cross}"
+SYSROOT="${SYSROOT:-/build-rpi/rpi/sysroot}"
 
-# Working dirs (relative to script directory)
-TOP_DIR="${PWD}"
-SRC_DIR="${TOP_DIR}/src"
-BUILD_DIR="${TOP_DIR}/build"
-LOG_DIR="${TOP_DIR}/logs"
+# These are *defaults for GCC*, not required build flags for your projects.
+# For Debian multiarch sysroots, keep arch broad and tune for Pi4 by default.
+TARGET_ARCH_BASE="${TARGET_ARCH_BASE:-armv8-a}"
+TARGET_TUNE="${TARGET_TUNE:-cortex-a72}"
+
+# Layout
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SRC_ROOT="${SRC_ROOT:-${ROOT_DIR}/src}"
+TARBALL_DIR="${TARBALL_DIR:-${ROOT_DIR}/tarballs}"
+BUILD_DIR="${BUILD_DIR:-${ROOT_DIR}/build}"
+LOG_DIR="${LOG_DIR:-${ROOT_DIR}/logs}"
 
 # Parallelism
-NPROC="$(nproc || echo 4)"
+JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
 
-# Where to fetch GNU tarballs from (can be changed to a local mirror)
-GNU_MIRROR="https://ftp.gnu.org/gnu"
+# Optional: when you have multiple prefixes and want to test/execute with another
+ACTIVE_PREFIX="${ACTIVE_PREFIX:-${PREFIX}}"
 
-########################################################################
-# Helpers
-########################################################################
+# Safety: to wipe PREFIX before installs, set CLEAN_PREFIX=1 (DANGEROUS)
+CLEAN_PREFIX="${CLEAN_PREFIX:-0}"
+
+# Reconfigure behavior: gcc configure results can become "sticky".
+# Default: nuke gcc build dir before configure to avoid stale multiarch/sysroot paths.
+RECONFIGURE="${RECONFIGURE:-1}"
+
+# Internal guard: ensure we only clean PREFIX once per script invocation
+PREFIX_CLEANED=0
+
+# ------------------------------ Versions / URLs -------------------------------
+# GCC
+GCC_VER="${GCC_VER:-14.2.0}"
+GCC_TARBALL="${GCC_TARBALL:-gcc-${GCC_VER}.tar.xz}"
+GCC_URL="${GCC_URL:-https://ftp.gnu.org/gnu/gcc/gcc-${GCC_VER}/${GCC_TARBALL}}"
+GCC_SHA256="${GCC_SHA256:-a7b39bc69cbf9e25826c5a60ab26477001f7c08d85cec04bc0e29cabed6f3cc9}"
+GCC_SRC_DIR="${GCC_SRC_DIR:-${SRC_ROOT}/gcc-${GCC_VER}}"
+
+# Binutils
+BINUTILS_VER="${BINUTILS_VER:-2.44}"
+BINUTILS_TARBALL="${BINUTILS_TARBALL:-binutils-${BINUTILS_VER}.tar.xz}"
+BINUTILS_URL="${BINUTILS_URL:-https://ftp.gnu.org/gnu/binutils/${BINUTILS_TARBALL}}"
+BINUTILS_SHA256="${BINUTILS_SHA256:-ce2017e059d63e67ddb9240e9d4ec49c2893605035cd60e92ad53177f4377237}"
+BINUTILS_SRC_DIR="${BINUTILS_SRC_DIR:-${SRC_ROOT}/binutils-${BINUTILS_VER}}"
+BINUTILS_BUILD_DIR="${BINUTILS_BUILD_DIR:-${BUILD_DIR}/binutils}"
+
+# ------------------------------ Helpers ---------------------------------------
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+mkdirp() { mkdir -p "$@"; }
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
 
 log_step() {
-    local name="$1"
-    shift
-    echo
-    echo "================================================================"
-    echo "==> ${name}"
-    echo "================================================================"
-    "$@" 2>&1 | tee "${LOG_DIR}/${name}.log"
+  local name="$1"; shift
+  local log="${LOG_DIR}/${name}.log"
+  mkdirp "${LOG_DIR}"
+  echo "==> ${name}"
+  echo "    log: ${log}"
+  ( "$@" ) > >(tee -a "${log}") 2> >(tee -a "${log}" 1>&2)
 }
 
-ensure_dirs() {
-    # Start from a clean sysroot each run for reproducibility.
-    rm -rf "${SYSROOT}"
-    mkdir -p "${SRC_DIR}" "${BUILD_DIR}" "${LOG_DIR}" "${SYSROOT}"
+clean_prefix_once() {
+  [[ "${CLEAN_PREFIX}" == "1" ]] || return 0
+  [[ "${PREFIX_CLEANED}" == "0" ]] || return 0
+  [[ -n "${PREFIX}" && "${PREFIX}" != "/" ]] || die "refusing to clean dangerous PREFIX='${PREFIX}'"
+  echo "WARNING: CLEAN_PREFIX=1, removing ${PREFIX}" >&2
+  rm -rf "${PREFIX}"
+  PREFIX_CLEANED=1
 }
 
+# ------------------------------ Download / Verify / Extract -------------------
+download_file() {
+  local url="$1"
+  local out="$2"
+  mkdirp "$(dirname "$out")"
+
+  if [[ -f "$out" ]]; then
+    echo "==> download: already present: $out"
+    return 0
+  fi
+
+  echo "==> download: $url"
+  if have_cmd curl; then
+    curl -L --fail -o "$out" "$url"
+  elif have_cmd wget; then
+    wget -O "$out" "$url"
+  else
+    die "need curl or wget to download: $url"
+  fi
+}
+
+verify_sha256() {
+  local file="$1"
+  local expect="${2:-}"
+
+  [[ -f "$file" ]] || die "verify_sha256: missing file: $file"
+  if [[ -z "$expect" ]]; then
+    echo "WARNING: no SHA256 provided for $(basename "$file") — skipping verification." >&2
+    return 0
+  fi
+  have_cmd sha256sum || die "sha256sum not found"
+
+  local got
+  got="$(sha256sum "$file" | awk '{print $1}')"
+  [[ "$got" == "$expect" ]] || die "SHA256 mismatch for $file: got $got expected $expect"
+  echo "==> sha256 ok: $(basename "$file")"
+}
+
+extract_tarball() {
+  local tarball="$1"
+  local dest="$2"
+
+  [[ -f "$tarball" ]] || die "extract_tarball: missing tarball: $tarball"
+
+  if [[ -d "$dest" && -f "$dest/configure" ]]; then
+    echo "==> extract: already extracted: $dest"
+    return 0
+  fi
+
+  echo "==> extract: $tarball -> $dest"
+  rm -rf "$dest"
+  mkdirp "$(dirname "$dest")"
+
+  local tmp
+  tmp="$(mktemp -d)"
+  tar -xf "$tarball" -C "$tmp"
+  local top
+  top="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n1 || true)"
+  [[ -n "$top" ]] || die "extract failed: no top-level dir in $tarball"
+  mv "$top" "$dest"
+  rm -rf "$tmp"
+
+  [[ -f "$dest/configure" ]] || die "extract result missing configure: $dest"
+}
+
+ensure_gcc_source() {
+  mkdirp "${SRC_ROOT}" "${TARBALL_DIR}"
+  if [[ -d "${GCC_SRC_DIR}" && -f "${GCC_SRC_DIR}/configure" ]]; then
+    :
+  else
+    local tb="${TARBALL_DIR}/${GCC_TARBALL}"
+    download_file "${GCC_URL}" "${tb}"
+    verify_sha256 "${tb}" "${GCC_SHA256}"
+    extract_tarball "${tb}" "${GCC_SRC_DIR}"
+  fi
+
+  # Ensure GCC prerequisites are present (gmp/mpfr/mpc/isl)
+  if [[ ! -f "${GCC_SRC_DIR}/gmp/README" ]]; then
+    echo "==> gcc: fetching prerequisites (gmp/mpfr/mpc/isl)"
+    ( cd "${GCC_SRC_DIR}" && ./contrib/download_prerequisites )
+  fi
+}
+
+ensure_binutils_source() {
+  mkdirp "${SRC_ROOT}" "${TARBALL_DIR}"
+  if [[ -d "${BINUTILS_SRC_DIR}" && -f "${BINUTILS_SRC_DIR}/configure" ]]; then
+    return 0
+  fi
+  local tb="${TARBALL_DIR}/${BINUTILS_TARBALL}"
+  download_file "${BINUTILS_URL}" "${tb}"
+  verify_sha256 "${tb}" "${BINUTILS_SHA256}"
+  extract_tarball "${tb}" "${BINUTILS_SRC_DIR}"
+}
+
+# ------------------------------ Env ------------------------------------------
 export_basic_env() {
-    # Host tools
-    export PATH="${PREFIX}/bin:${PATH}"
-    export LC_ALL=C
-    umask 022
+  export LC_ALL=C
+  umask 022
+
+  : "${ACTIVE_PREFIX:=${PREFIX}}"
+  SYSROOT="${SYSROOT%/}"
+  PREFIX="${PREFIX%/}"
+
+  # Keep environment clean: do NOT export LD_LIBRARY_PATH globally.
+  export PATH="${ACTIVE_PREFIX}/bin:${PATH}"
+
+  export CFLAGS="${CFLAGS:--O2 -pipe}"
+  export CXXFLAGS="${CXXFLAGS:--O2 -pipe}"
 }
 
-########################################################################
-# Optional: install Debian build dependencies
-########################################################################
+# ------------------------------ Preconditions ---------------------------------
+require_sysroot() {
+  [[ -d "${SYSROOT}" ]] || die "SYSROOT not found: ${SYSROOT}"
+  [[ -d "${SYSROOT}/usr/include" ]] || die "SYSROOT missing usr/include: ${SYSROOT}"
 
-install_deps_debian() {
-    if command -v apt-get >/dev/null 2>&1; then
-        echo "Installing Debian build dependencies (requires sudo)..."
-        sudo apt-get update
-        sudo apt-get install -y \
-            build-essential wget curl ca-certificates \
-            bison flex texinfo \
-            gawk libgmp-dev libmpfr-dev libmpc-dev libisl-dev \
-            libzstd-dev zlib1g-dev \
-            python3
-    else
-        echo "apt-get not found; please ensure equivalent build deps are installed."
-    fi
+  # Debian multiarch sysroots: these typically live under /usr/lib/aarch64-linux-gnu
+  find "${SYSROOT}" -type f \( -name crt1.o -o -name crti.o -o -name crtn.o \) >/dev/null \
+    || die "SYSROOT missing crt*.o start files (crt1.o/crti.o/crtn.o)"
+
+  find "${SYSROOT}" -type f -name 'ld-linux-aarch64.so.1' >/dev/null \
+    || die "SYSROOT missing dynamic linker ld-linux-aarch64.so.1"
+
+  [[ -f "${SYSROOT}/usr/lib/aarch64-linux-gnu/libc.so" ]] || \
+    echo "WARNING: libc.so not found at /usr/lib/aarch64-linux-gnu/libc.so (link-time libc script). Continuing..." >&2
 }
 
-########################################################################
-# Download sources
-########################################################################
-
-download_sources() {
-    cd "${SRC_DIR}"
-
-    # Binutils
-    if [[ ! -f "binutils-${BINUTILS_VER}.tar.xz" ]]; then
-        wget "${GNU_MIRROR}/binutils/binutils-${BINUTILS_VER}.tar.xz"
-    fi
-    [[ -d "binutils-${BINUTILS_VER}" ]] || tar xf "binutils-${BINUTILS_VER}.tar.xz"
-
-    # GCC
-    if [[ ! -f "gcc-${GCC_VER}.tar.xz" ]]; then
-        wget "${GNU_MIRROR}/gcc/gcc-${GCC_VER}/gcc-${GCC_VER}.tar.xz"
-    fi
-    if [[ ! -d "gcc-${GCC_VER}" ]]; then
-        tar xf "gcc-${GCC_VER}.tar.xz"
-        # Get GCC prerequisites (gmp/mpfr/mpc/isl as in-tree libs)
-        (cd "gcc-${GCC_VER}" && ./contrib/download_prerequisites)
-    fi
-
-    # Glibc
-    if [[ ! -f "glibc-${GLIBC_VER}.tar.xz" ]]; then
-        wget "${GNU_MIRROR}/glibc/glibc-${GLIBC_VER}.tar.xz"
-    fi
-    [[ -d "glibc-${GLIBC_VER}" ]] || tar xf "glibc-${GLIBC_VER}.tar.xz"
-
-    # Linux kernel (for headers)
-    if [[ ! -f "linux-${LINUX_VER}.tar.xz" ]]; then
-        wget "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${LINUX_VER}.tar.xz"
-    fi
-    [[ -d "linux-${LINUX_VER}" ]] || tar xf "linux-${LINUX_VER}.tar.xz"
+require_binutils_in_prefix() {
+  [[ -x "${PREFIX}/bin/${TARGET}-as" ]] || die "missing ${PREFIX}/bin/${TARGET}-as (binutils not installed or prefix cleaned)"
+  [[ -x "${PREFIX}/bin/${TARGET}-ld" ]] || die "missing ${PREFIX}/bin/${TARGET}-ld (binutils not installed or prefix cleaned)"
 }
 
-########################################################################
-# Step 1: Install Linux headers into sysroot (for AArch64)
-########################################################################
-
-install_linux_headers() {
-    local bdir="${BUILD_DIR}/linux-headers"
-    rm -rf "${bdir}"
-    mkdir -p "${bdir}"
-    cd "${bdir}"
-
-    log_step "linux-headers" \
-        make -C "${SRC_DIR}/linux-${LINUX_VER}" \
-            ARCH=arm64 \
-            INSTALL_HDR_PATH="${SYSROOT}/usr" \
-            headers_install
-}
-
-########################################################################
-# Step 2: Build Binutils for TARGET
-########################################################################
-
+# ----------------------------- Build: binutils --------------------------------
 build_binutils() {
-    local bdir="${BUILD_DIR}/binutils-${BINUTILS_VER}"
-    rm -rf "${bdir}"
-    mkdir -p "${bdir}"
-    cd "${bdir}"
+  export_basic_env
+  require_sysroot
+  ensure_binutils_source
 
-    log_step "binutils-configure" \
-        "${SRC_DIR}/binutils-${BINUTILS_VER}/configure" \
-            --target="${TARGET}" \
-            --prefix="${PREFIX}" \
-            --with-sysroot="${SYSROOT}" \
-            --disable-multilib \
-            --disable-nls \
-            --disable-werror
+  have_cmd make || die "missing make"
+  have_cmd gcc || die "missing host gcc"
 
-    log_step "binutils-make" make -j"${NPROC}"
-    log_step "binutils-install" make install
+  clean_prefix_once
+  mkdirp "${BINUTILS_BUILD_DIR}"
+
+  log_step "configure-binutils" bash -lc "
+    cd '${BINUTILS_BUILD_DIR}'
+    '${BINUTILS_SRC_DIR}/configure' \
+      --target='${TARGET}' \
+      --prefix='${PREFIX}' \
+      --with-sysroot='${SYSROOT}' \
+      --disable-multilib \
+      --disable-werror \
+      --disable-nls \
+      --enable-plugins \
+      --enable-lto \
+      --enable-gold \
+      --enable-ld=default \
+      --with-system-zlib
+  "
+
+  log_step "build-binutils" bash -lc "
+    cd '${BINUTILS_BUILD_DIR}'
+    make -j'${JOBS}'
+  "
+
+  log_step "install-binutils" bash -lc "
+    cd '${BINUTILS_BUILD_DIR}'
+    make install
+  "
+
+  echo "==> binutils installed to ${PREFIX}"
 }
 
-########################################################################
-# Step 3: Build GCC stage1 (no headers, C only, libc-independent)
-########################################################################
+# ----------------------------- Build: GCC final -------------------------------
+build_toolchain() {
+  export_basic_env
+  require_sysroot
+  ensure_gcc_source
 
-build_gcc_stage1() {
-    local bdir="${BUILD_DIR}/gcc-${GCC_VER}-stage1"
-    rm -rf "${bdir}"
-    mkdir -p "${bdir}"
-    cd "${bdir}"
+  have_cmd make || die "missing make"
+  have_cmd gcc || die "missing host gcc"
+  have_cmd g++ || die "missing host g++"
 
-    export_basic_env
+  # If CLEAN_PREFIX=1 and user ran only "gcc", this would nuke the prefix.
+  # Keep behavior consistent: only clean once per invocation, but also ensure binutils exist.
+  clean_prefix_once
 
-    # Minimal, libc-free cross GCC (LFS-style pass 1) for AArch64.
-    log_step "gcc-stage1-configure" \
-        "${SRC_DIR}/gcc-${GCC_VER}/configure" \
-            --target="${TARGET}" \
-            --prefix="${PREFIX}" \
-            --with-glibc-version="${GLIBC_VER}" \
-            --with-sysroot="${SYSROOT}" \
-            --with-newlib \
-            --without-headers \
-            --disable-nls \
-            --disable-shared \
-            --disable-multilib \
-            --disable-decimal-float \
-            --disable-threads \
-            --disable-libatomic \
-            --disable-libgomp \
-            --disable-libquadmath \
-            --disable-libssp \
-            --disable-libvtv \
-            --disable-libstdcxx \
-            --enable-languages=c \
-            --with-arch=armv8-a \
-            --with-tune=cortex-a72
+  # Binutils must exist for target compilation tests (libgcc configure)
+  require_binutils_in_prefix
 
-    # Only build what we need: compiler + target libgcc
-    log_step "gcc-stage1-make-all-gcc" \
-        make -j"${NPROC}" all-gcc
+  local gcc_build="${BUILD_DIR}/gcc-final"
 
-    log_step "gcc-stage1-make-all-target-libgcc" \
-        make -j"${NPROC}" all-target-libgcc
+  if [[ "${RECONFIGURE}" == "1" ]]; then
+    echo "==> gcc: RECONFIGURE=1, removing build dir: ${gcc_build}"
+    rm -rf "${gcc_build}"
+  fi
+  mkdirp "${gcc_build}"
 
-    log_step "gcc-stage1-install-gcc" \
-        make install-gcc
+  local with_as=""
+  local with_ld=""
+  if [[ -x "${PREFIX}/bin/${TARGET}-as" ]]; then
+    with_as="--with-as=${PREFIX}/bin/${TARGET}-as"
+  fi
+  if [[ -x "${PREFIX}/bin/${TARGET}-ld" ]]; then
+    with_ld="--with-ld=${PREFIX}/bin/${TARGET}-ld"
+  fi
 
-    log_step "gcc-stage1-install-target-libgcc" \
-        make install-target-libgcc
+  log_step "configure-gcc-final" bash -lc "
+    cd '${gcc_build}'
+    '${GCC_SRC_DIR}/configure' \
+      --target='${TARGET}' \
+      --prefix='${PREFIX}' \
+      --with-sysroot='${SYSROOT}' \
+      --with-build-sysroot='${SYSROOT}' \
+      --with-native-system-header-dir=/usr/include \
+      --enable-multiarch \
+      --disable-multilib \
+      --enable-languages=c,c++ \
+      --enable-shared \
+      --enable-threads=posix \
+      --enable-linker-build-id \
+      --enable-plugin \
+      --enable-lto \
+      --with-system-zlib \
+      --without-included-gettext \
+      --enable-checking=release \
+      --disable-werror \
+      --with-arch='${TARGET_ARCH_BASE}' \
+      --with-tune='${TARGET_TUNE}' \
+      --disable-bootstrap \
+      --enable-default-pie \
+      --enable-default-ssp \
+      ${with_as} ${with_ld}
+  "
 
-    # Create internal limits.h (same idea as LFS) so glibc build has a
-    # sane <limits.h> from this compiler.
-    echo
-    echo "================================================================"
-    echo "==> gcc-stage1: creating internal limits.h"
-    echo "================================================================"
+  log_step "build-gcc-final" bash -lc "
+    cd '${gcc_build}'
+    make -j'${JOBS}'
+  "
 
-    local libgcc_file libgcc_dir
-    libgcc_file="$("${TARGET}-gcc" -print-libgcc-file-name)"
-    libgcc_dir="$(dirname "${libgcc_file}")"
+  log_step "install-gcc-final" bash -lc "
+    cd '${gcc_build}'
+    make install
+  "
 
-    mkdir -p "${libgcc_dir}/install-tools/include"
-
-    cat "${SRC_DIR}/gcc-${GCC_VER}/gcc/limitx.h" \
-        "${SRC_DIR}/gcc-${GCC_VER}/gcc/glimits.h" \
-        "${SRC_DIR}/gcc-${GCC_VER}/gcc/limity.h" > \
-        "${libgcc_dir}/install-tools/include/limits.h"
+  echo
+  echo "==> GCC installed to ${PREFIX}"
 }
 
-########################################################################
-# Step 4: Glibc headers + start files (for AArch64)
-########################################################################
-
-build_glibc_headers_startfiles() {
-    local bdir="${BUILD_DIR}/glibc-${GLIBC_VER}-headers"
-    rm -rf "${bdir}"
-    mkdir -p "${bdir}"
-    cd "${bdir}"
-
-    export_basic_env
-
-    # Use the just-built cross-compiler
-    export CC="${TARGET}-gcc"
-    export CXX="${TARGET}-g++"
-    export AR="${TARGET}-ar"
-    export RANLIB="${TARGET}-ranlib"
-    export LD="${TARGET}-ld"
-
-    # Cross-style glibc: prefix=/usr, install into SYSROOT via DESTDIR.
-    log_step "glibc-headers-configure" \
-        "${SRC_DIR}/glibc-${GLIBC_VER}/configure" \
-            --host="${TARGET}" \
-            --build=$("${SRC_DIR}/glibc-${GLIBC_VER}/scripts/config.guess") \
-            --prefix=/usr \
-            --with-headers="${SYSROOT}/usr/include" \
-            --disable-multilib \
-            --enable-kernel="$LINUX_MAINLINE_VER"
-
-    # Install headers (bootstrap mode)
-    log_step "glibc-headers-make-install-headers" \
-        make install-bootstrap-headers=yes install-headers DESTDIR="${SYSROOT}"
-
-    # Create dummy libc.so
-    mkdir -p "${SYSROOT}/usr/lib"
-    touch "${SYSROOT}/usr/lib/libc.so"
-
-    # Build csu objects (crt1.o, crti.o, crtn.o) in the build tree
-    log_step "glibc-headers-make-csu" \
-        make -j1 csu/subdir_lib
-
-    install -D csu/crt1.o   "${SYSROOT}/usr/lib/crt1.o"
-    install -D csu/crti.o   "${SYSROOT}/usr/lib/crti.o"
-    install -D csu/crtn.o   "${SYSROOT}/usr/lib/crtn.o"
-
-    # A minimal libc_nonshared.a is often useful; full glibc will replace it.
-    if [[ -f "libc_nonshared.a" ]]; then
-        install -D libc_nonshared.a "${SYSROOT}/usr/lib/libc_nonshared.a"
-    fi
-
-    # Make sure <gnu/stubs.h> exists so features.h can include it
-    mkdir -p "${SYSROOT}/usr/include/gnu"
-    touch "${SYSROOT}/usr/include/gnu/stubs.h"
+build_all() {
+  build_binutils
+  build_toolchain
 }
 
-########################################################################
-# Step 5: Build full Glibc for AArch64
-########################################################################
+# ------------------------------ Main ------------------------------------------
+usage() {
+  cat <<EOF
+Usage: $0 <command>
 
-build_glibc_full() {
-    local bdir="${BUILD_DIR}/glibc-${GLIBC_VER}-full"
-    rm -rf "${bdir}"
-    mkdir -p "${bdir}"
-    cd "${bdir}"
+Commands:
+  binutils   Download/extract (if needed) + build+install cross binutils into PREFIX
+  gcc        Download/extract (if needed) + build+install final GCC (C,C++) into PREFIX
+  build      Build binutils then GCC
 
-    export_basic_env
-    export CC="${TARGET}-gcc"
-    export CXX="${TARGET}-g++"
-    export AR="${TARGET}-ar"
-    export RANLIB="${TARGET}-ranlib"
-    export LD="${TARGET}-ld"
+Env toggles:
+  CLEAN_PREFIX=1      Remove PREFIX before install (dangerous, now only happens once per run)
+  RECONFIGURE=0       Reuse existing gcc build dir (not recommended)
+  TARGET_ARCH_BASE=   Default arch for GCC (default: armv8-a)
+  TARGET_TUNE=        Default tune for GCC (default: cortex-a72)
 
-    log_step "glibc-full-configure" \
-        "${SRC_DIR}/glibc-${GLIBC_VER}/configure" \
-            --host="${TARGET}" \
-            --build=$("${SRC_DIR}/glibc-${GLIBC_VER}/scripts/config.guess") \
-            --prefix=/usr \
-            --with-headers="${SYSROOT}/usr/include" \
-            --disable-multilib \
-            --enable-kernel="$LINUX_MAINLINE_VER"
-
-    log_step "glibc-full-make" make -j"${NPROC}"
-    log_step "glibc-full-install" \
-        make install DESTDIR="${SYSROOT}"
-}
-
-########################################################################
-# Step 6: GCC final cross compiler (no bootstrap)
-########################################################################
-
-build_gcc_final_cross() {
-    local bdir="${BUILD_DIR}/gcc-${GCC_VER}-final"
-    rm -rf "${bdir}"
-    mkdir -p "${bdir}"
-    cd "${bdir}"
-
-    export_basic_env
-
-    # Use system compilers as host/build compilers.
-    unset CC CXX AR RANLIB LD
-    export CC_FOR_BUILD=gcc
-    export CC=gcc
-    export CXX=g++
-
-    log_step "gcc-final-configure" \
-        "${SRC_DIR}/gcc-${GCC_VER}/configure" \
-            --build="$(gcc -dumpmachine)" \
-            --host="$(gcc -dumpmachine)" \
-            --target="${TARGET}" \
-            --prefix="${PREFIX}" \
-            --with-sysroot="${SYSROOT}" \
-            --disable-multilib \
-            --disable-nls \
-            --enable-languages=c,ada,c++,go,d,fortran,objc,obj-c++,m2,rust \
-            --enable-shared \
-            --enable-threads=posix \
-            --enable-__cxa_atexit \
-            --enable-linker-build-id \
-            --with-arch=armv8-a \
-            --with-tune=cortex-a72
-
-    log_step "gcc-final-make" make -j"${NPROC}"
-    log_step "gcc-final-install" make install
-}
-
-########################################################################
-# Step 7: Sanity checks (cross)
-########################################################################
-
-sanity_test() {
-    export_basic_env
-
-    echo
-    echo "================================================================"
-    echo "==> Sanity test: ${TARGET}-gcc --version"
-    echo "================================================================"
-    "${TARGET}-gcc" --version || {
-        echo "ERROR: ${TARGET}-gcc not found or not working"
-        return 1
-    }
-
-    tmpdir="$(mktemp -d)"
-    cat > "${tmpdir}/hello.c" << 'EOF'
-#include <stdio.h>
-int main(void) {
-    printf("Hello from AArch64 cross GCC toolchain!\n");
-    return 0;
-}
+Dirs:
+  SRC_ROOT=${SRC_ROOT}
+  TARBALL_DIR=${TARBALL_DIR}
+  BUILD_DIR=${BUILD_DIR}
+  LOG_DIR=${LOG_DIR}
 EOF
-
-    echo
-    echo "================================================================"
-    echo "==> Building AArch64 test program with ${TARGET}-gcc"
-    echo "================================================================"
-    "${TARGET}-gcc" -O2 -g -o "${tmpdir}/hello" "${tmpdir}/hello.c"
-
-    echo "Test binary built for AArch64:"
-    file "${tmpdir}/hello" || true
-
-    echo
-    echo "================================================================"
-    echo "Cross toolchain appears to be usable."
-    echo "Prefix : ${PREFIX}"
-    echo "Sysroot: ${SYSROOT}"
-    echo "Target : ${TARGET}"
-    echo "================================================================"
-
-    rm -rf "${tmpdir}"
 }
-
-########################################################################
-# Main driver
-########################################################################
 
 main() {
-    ensure_dirs
-    export_basic_env
-
-    # Uncomment if you want the script to install build deps on Debian:
-    # install_deps_debian
-
-    download_sources
-    install_linux_headers
-    build_binutils
-    build_gcc_stage1
-    build_glibc_headers_startfiles
-    build_glibc_full
-    build_gcc_final_cross
-    sanity_test
+  echo "Version: $SCRIPT_VERSION"
+  local cmd="${1:-}"
+  case "${cmd}" in
+    binutils) build_binutils ;;
+    gcc)      build_toolchain ;;
+    build)    build_all ;;
+    ""|help|-h|--help) usage ;;
+    *) die "unknown command: ${cmd}" ;;
+  esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
