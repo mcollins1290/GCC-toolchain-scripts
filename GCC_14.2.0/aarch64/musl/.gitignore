@@ -1,0 +1,9 @@
+# Ignore everything in this folder
+*
+
+# But track these two scripts
+!build-gcc14-musl-cross.sh
+!test-gcc14-cross-toolchain-musl.sh
+
+# (Optional) also track the .gitignore itself
+!.gitignore

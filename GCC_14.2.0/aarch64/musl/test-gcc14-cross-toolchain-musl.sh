@@ -1,0 +1,1606 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# ==============================================================================
+# test-gcc14-cross-toolchain-musl.sh
+# Run the following 4 tests and if all pass then toolchain is solid:
+#
+# 1)
+# SYSROOT_LINK_AUDIT=1 A_PLUS=1 LINK_MODE=dynamic ./test-gcc14-cross-toolchain-musl.sh all
+#
+# 2)
+# LINK_MODE=static SYSROOT_LINK_AUDIT=1 STRESS_CPP=1 STRESS_LTO_MATRIX=1 ./test-gcc14-cross-toolchain-musl.sh all
+#
+# 3)
+# LINK_MODE=dynamic SYSROOT_LINK_AUDIT=1 STRESS_CPP=1 STRESS_LTO_MATRIX=1 STRESS_DLOPEN_THREADS=1 STRESS_RTLD_COLLISION=1 ./test-gcc14-cross-toolchain-musl.sh smoke
+#
+# 4)
+# LINK_MODE=dynamic INTEGRATION=1 PI_TLS_SELFCONTAINED=1 PI_NET_TEST=1 ./test-gcc14-cross-toolchain-musl.sh nightly
+#
+# ==============================================================================
+SCRIPT_VERSION="v0.0.34"
+
+# ------------------------------ Defaults --------------------------------------
+TARGET="${TARGET:-aarch64-linux-musl}"
+TC_PREFIX="${TC_PREFIX:-/opt/gcc-14.2.0-musl-cross}"
+SYSROOT="${SYSROOT:-${TC_PREFIX}/${TARGET}/sysroot}"
+
+# LINK_MODE:
+#   auto    -> detect based on sysroot contents (static-first)
+#   dynamic -> build/run dynamic suite (dlopen/DSO tests enabled)
+#   static  -> build/run static suite (dlopen/DSO tests skipped)
+LINK_MODE="${LINK_MODE:-auto}"
+
+QEMU_AARCH64="${QEMU_AARCH64:-qemu-aarch64}"
+
+PI_SSH="${PI_SSH:-root@raspberrypi2.totten}"
+PI_SSH_PORT="${PI_SSH_PORT:-22}"
+PI_TMPDIR="${PI_TMPDIR:-/tmp/gcc14-toolchain-tests}"
+
+# Optional: Pi sysroot on host (for CA bundle, etc.)
+PI_SYSROOT="${PI_SYSROOT:-/build-rpi/rpi/sysroot}"
+
+INTEGRATION="${INTEGRATION:-0}"
+INTEGRATION_RUN_ON_PI="${INTEGRATION_RUN_ON_PI:-0}"
+PI_INTEGRATION_DIR="${PI_INTEGRATION_DIR:-/tmp/gcc14-toolchain-integration}"
+
+PI_NET_TEST="${PI_NET_TEST:-1}"
+PI_NET_TEST_URL="${PI_NET_TEST_URL:-https://example.com}"
+
+# When set, we stage a CA bundle into INSTALL_DIR and use it via explicit --cacert
+PI_TLS_SELFCONTAINED="${PI_TLS_SELFCONTAINED:-0}"
+CA_BUNDLE_URL="${CA_BUNDLE_URL:-https://curl.se/ca/cacert.pem}"
+
+# Stress toggles (rare failure modes)
+STRESS_CPP="${STRESS_CPP:-0}"
+STRESS_DLOPEN_THREADS="${STRESS_DLOPEN_THREADS:-1}"
+STRESS_DLOPEN_THREADS_N="${STRESS_DLOPEN_THREADS_N:-4}"
+STRESS_DLOPEN_ITERS="${STRESS_DLOPEN_ITERS:-250}"
+
+STRESS_RTLD_COLLISION="${STRESS_RTLD_COLLISION:-1}"
+STRESS_OPENSSL_TLS="${STRESS_OPENSSL_TLS:-1}"
+
+# A+ extra tests (optional)
+STRESS_LTO_MATRIX="${STRESS_LTO_MATRIX:-0}"         # build LTO a few ways
+STRESS_STRIP_VERIFY="${STRESS_STRIP_VERIFY:-1}"     # ensure strip doesn't break runtime (dynamic only)
+STRESS_LIBSTDCPP_ABI="${STRESS_LIBSTDCPP_ABI:-1}"   # small C++ ABI sanity (dynamic+static ok)
+
+ZLIB_VER="${ZLIB_VER:-1.3.1}"
+
+OPENSSL_VER="${OPENSSL_VER:-3.3.2}"
+OPENSSL_URL="${OPENSSL_URL:-https://www.openssl.org/source/openssl-${OPENSSL_VER}.tar.gz}"
+
+CURL_VER="${CURL_VER:-8.11.1}"
+CURL_URL="${CURL_URL:-https://curl.se/download/curl-${CURL_VER}.tar.gz}"
+
+CURL_DISABLE_LIBPSL="${CURL_DISABLE_LIBPSL:-1}"
+CURL_DISABLE_BROTLI="${CURL_DISABLE_BROTLI:-1}"
+
+# Sanity sysroot purity audit
+SYSROOT_LINK_AUDIT="${SYSROOT_LINK_AUDIT:-1}"
+
+JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
+WORK_DIR="${WORK_DIR:-$(pwd)/.toolchain-test-work}"
+LOG_DIR="${LOG_DIR:-$(pwd)/logs-tests}"
+CACHE_DIR="${CACHE_DIR:-$(pwd)/.toolchain-test-cache}"
+TARBALL_DIR="${TARBALL_DIR:-${CACHE_DIR}/tarballs}"
+SRC_DIR="${SRC_DIR:-${CACHE_DIR}/src}"
+BUILD_DIR="${BUILD_DIR:-${CACHE_DIR}/build}"
+INSTALL_DIR="${INSTALL_DIR:-${CACHE_DIR}/install/${TARGET}}"
+
+KEEP_WORKDIR="${KEEP_WORKDIR:-0}"
+KEEP_CACHE="${KEEP_CACHE:-1}"
+
+# ------------------------------ A+ Super Suite Switch --------------------------
+A_PLUS="${A_PLUS:-0}"
+if [[ "${A_PLUS}" == "1" ]]; then
+  echo "A_PLUS=1: enabling full integration + stress suite"
+
+  # A+ is inherently dynamic (integration builds shared curl + dlopen stress)
+  if [[ "${LINK_MODE}" == "static" ]]; then
+    echo "ERROR: A_PLUS=1 is not compatible with LINK_MODE=static (integration/dlopen suite is dynamic)." >&2
+    exit 2
+  fi
+
+  INTEGRATION=1
+  INTEGRATION_RUN_ON_PI=1
+  PI_NET_TEST=1
+  PI_TLS_SELFCONTAINED=1
+
+  STRESS_CPP=1
+  STRESS_DLOPEN_THREADS=1
+  STRESS_DLOPEN_THREADS_N="${STRESS_DLOPEN_THREADS_N:-6}"
+  STRESS_DLOPEN_ITERS="${STRESS_DLOPEN_ITERS:-750}"
+
+  STRESS_RTLD_COLLISION=1
+  STRESS_OPENSSL_TLS=1
+
+  STRESS_LTO_MATRIX=1
+  STRESS_STRIP_VERIFY=1
+  STRESS_LIBSTDCPP_ABI=1
+fi
+
+# ------------------------------ PASS/FAIL semantics ----------------------------
+CURRENT_TIER=""
+TIER_STATUS_DIR=""
+
+on_err() {
+  local exit_code=$?
+  if [[ -n "${CURRENT_TIER}" ]]; then
+    echo
+    echo ">>> ${CURRENT_TIER}: FAIL (exit=${exit_code})"
+    [[ -n "${TIER_STATUS_DIR}" ]] && echo "FAIL" > "${TIER_STATUS_DIR}/${CURRENT_TIER}.status" 2>/dev/null || true
+  else
+    echo
+    echo ">>> FAIL (exit=${exit_code})"
+  fi
+  echo ">>> Last command: ${BASH_COMMAND}"
+  echo ">>> Hint: check logs in: ${LOG_DIR}"
+  exit "${exit_code}"
+}
+trap on_err ERR
+
+mark_tier_start() {
+  local tier="$1"
+  CURRENT_TIER="${tier}"
+  mkdir -p "${LOG_DIR}"
+  TIER_STATUS_DIR="${LOG_DIR}/.status"
+  mkdir -p "${TIER_STATUS_DIR}"
+  echo "RUNNING" > "${TIER_STATUS_DIR}/${tier}.status"
+}
+
+mark_tier_pass() {
+  local tier="$1"
+  echo "PASS" > "${TIER_STATUS_DIR}/${tier}.status"
+  echo "==> ${tier}: PASS"
+  CURRENT_TIER=""
+}
+
+tier_summary() {
+  local sdir="${LOG_DIR}/.status"
+  echo
+  echo "==================== Tier Summary ===================="
+  for t in report sanity smoke nightly; do
+    if [[ -f "${sdir}/${t}.status" ]]; then
+      printf "%-8s : %s\n" "${t}" "$(cat "${sdir}/${t}.status")"
+    fi
+  done
+  echo "======================================================"
+}
+
+# ------------------------------ Helpers ---------------------------------------
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+mkdirp() { mkdir -p "$@"; }
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+log() { echo "==> $*"; }
+
+run_logged() {
+  local name="$1"; shift
+  local logf="${LOG_DIR}/${name}.log"
+  mkdirp "${LOG_DIR}"
+  log "${name}"
+  echo "    log: ${logf}"
+  ( "$@" ) > >(tee -a "${logf}") 2> >(tee -a "${logf}" 1>&2)
+}
+
+cleanup() {
+  if [[ "${KEEP_WORKDIR}" == "1" ]]; then
+    log "KEEP_WORKDIR=1 leaving work dir: ${WORK_DIR}"
+  else
+    rm -rf "${WORK_DIR}" >/dev/null 2>&1 || true
+  fi
+
+  if [[ "${KEEP_CACHE}" == "0" ]]; then
+    rm -rf "${CACHE_DIR}" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
+tc() { "${TC_PREFIX}/bin/${TARGET}-$@"; }
+
+detect_link_mode() {
+  case "${LINK_MODE}" in
+    static|dynamic) return 0 ;;
+    auto)
+      # prefer static if libc.a exists
+      if [[ -f "${SYSROOT}/lib/libc.a" || -f "${SYSROOT}/usr/lib/libc.a" ]]; then
+        LINK_MODE="static"
+        return 0
+      fi
+      if [[ -e "${SYSROOT}/lib/ld-musl-aarch64.so.1" || -e "${SYSROOT}/lib/ld-linux-aarch64.so.1" ]]; then
+        LINK_MODE="dynamic"
+        return 0
+      fi
+      die "LINK_MODE=auto but could not detect: no libc.a in ${SYSROOT}/{lib,usr/lib} and no loader in ${SYSROOT}/lib."
+      ;;
+    *) die "Invalid LINK_MODE='${LINK_MODE}'. Use: auto|dynamic|static" ;;
+  esac
+}
+
+need_paths() {
+  [[ -x "${TC_PREFIX}/bin/${TARGET}-gcc" ]] || die "missing compiler: ${TC_PREFIX}/bin/${TARGET}-gcc"
+  [[ -x "${TC_PREFIX}/bin/${TARGET}-g++" ]] || die "missing compiler: ${TC_PREFIX}/bin/${TARGET}-g++"
+  [[ -x "${TC_PREFIX}/bin/${TARGET}-ar"  ]] || die "missing: ${TC_PREFIX}/bin/${TARGET}-ar"
+  [[ -x "${TC_PREFIX}/bin/${TARGET}-ranlib"  ]] || die "missing: ${TC_PREFIX}/bin/${TARGET}-ranlib"
+  [[ -d "${SYSROOT}/usr/include" ]] || die "missing sysroot headers: ${SYSROOT}/usr/include"
+
+  detect_link_mode
+
+  if [[ "${LINK_MODE}" == "dynamic" ]]; then
+    if [[ ! -e "${SYSROOT}/lib/ld-musl-aarch64.so.1" && ! -e "${SYSROOT}/lib/ld-linux-aarch64.so.1" ]]; then
+      die "LINK_MODE=dynamic but no dynamic loader found in ${SYSROOT}/lib (expected ld-musl-aarch64.so.1 or ld-linux-aarch64.so.1)"
+    fi
+  else
+    if [[ ! -f "${SYSROOT}/lib/libc.a" && ! -f "${SYSROOT}/usr/lib/libc.a" ]]; then
+      die "LINK_MODE=static but no libc.a found in ${SYSROOT}/{lib,usr/lib}"
+    fi
+  fi
+}
+
+need_qemu() {
+  have_cmd "${QEMU_AARCH64}" || die "missing ${QEMU_AARCH64}. Install qemu-user (Debian: apt install qemu-user)"
+}
+
+qemu_run() {
+  detect_link_mode
+  if [[ "${LINK_MODE}" == "dynamic" ]]; then
+    "${QEMU_AARCH64}" -L "${SYSROOT}" "$@"
+  else
+    "${QEMU_AARCH64}" "$@"
+  fi
+}
+
+download() {
+  local url="$1"
+  local out="$2"
+  mkdirp "$(dirname "$out")"
+  if [[ -f "$out" ]]; then
+    echo "==> download: already present: $out"
+    return 0
+  fi
+  echo "==> download: $url"
+  if have_cmd curl; then
+    curl -L --fail -o "$out" "$url"
+  elif have_cmd wget; then
+    wget -O "$out" "$url"
+  else
+    die "need curl or wget to download: $url"
+  fi
+}
+
+download_try() {
+  # download_try <out> <url1> [url2 ...]
+  local out="$1"; shift
+  mkdirp "$(dirname "$out")"
+  if [[ -f "$out" ]]; then
+    echo "==> download: already present: $out"
+    return 0
+  fi
+
+  local u
+  for u in "$@"; do
+    echo "==> download_try: $u"
+    if have_cmd curl; then
+      if curl -L --fail -o "$out" "$u"; then
+        return 0
+      fi
+    elif have_cmd wget; then
+      if wget -O "$out" "$u"; then
+        return 0
+      fi
+    else
+      die "need curl or wget to download: $u"
+    fi
+    rm -f "$out" >/dev/null 2>&1 || true
+  done
+
+  die "all download attempts failed for: $out"
+}
+
+extract() {
+  local tarball="$1"
+  local dest="$2"
+  mkdirp "$(dirname "$dest")"
+  rm -rf "$dest"
+  local tmp
+  tmp="$(mktemp -d)"
+  tar -xf "$tarball" -C "$tmp"
+  local top
+  top="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n1 || true)"
+  [[ -n "$top" ]] || die "extract failed: no top-level dir in $tarball"
+  mv "$top" "$dest"
+  rm -rf "$tmp"
+}
+
+inspect_elf() {
+  local bin="$1"
+  run_logged "inspect-$(basename "$bin")" bash -c "
+    set -e
+    echo '--- file ---'
+    file '$bin'
+    echo
+    echo '--- interpreter ---'
+    readelf -l '$bin' | grep -E 'Requesting program interpreter' || true
+    echo
+    echo '--- NEEDED ---'
+    readelf -d '$bin' | grep -E 'NEEDED' || true
+  "
+}
+
+assert_static_elf_clean() {
+  detect_link_mode
+  [[ "${LINK_MODE}" == "static" ]] || return 0
+
+  local bin="$1"
+  have_cmd readelf || die "missing readelf"
+
+  if readelf -l "${bin}" 2>/dev/null | grep -E 'INTERP|Requesting program interpreter' >/dev/null 2>&1; then
+    echo
+    echo ">>> STATIC ASSERT FAIL: interpreter present in: ${bin}"
+    echo ">>> readelf -l (INTERP excerpt):"
+    readelf -l "${bin}" | grep -E 'INTERP|Requesting program interpreter' || true
+    echo
+    die "LINK_MODE=static requires no ELF interpreter (PT_INTERP)."
+  fi
+
+  if readelf -d "${bin}" 2>/dev/null | grep -E 'NEEDED' >/dev/null 2>&1; then
+    echo
+    echo ">>> STATIC ASSERT FAIL: DT_NEEDED entries present in: ${bin}"
+    echo ">>> readelf -d (NEEDED excerpt):"
+    readelf -d "${bin}" | grep -E 'NEEDED' || true
+    echo
+    die "LINK_MODE=static requires zero DT_NEEDED entries."
+  fi
+}
+
+# ------------------------------ Sysroot Link Audit -----------------------------
+sysroot_link_audit() {
+  [[ "${SYSROOT_LINK_AUDIT}" == "1" ]] || { log "SYSROOT_LINK_AUDIT=0: skipping"; return 0; }
+
+  have_cmd grep || die "missing grep"
+  have_cmd readelf || die "missing readelf"
+
+  detect_link_mode
+
+  mkdirp "${WORK_DIR}/src" "${WORK_DIR}/bin"
+
+  cat > "${WORK_DIR}/src/link_audit.c" <<'EOF'
+#include <stdio.h>
+int main(){ puts("link-audit"); return 0; }
+EOF
+
+  local sys=(--sysroot="${SYSROOT}")
+  local cflags=(-O2)
+  local ldflags=()
+
+  if [[ "${LINK_MODE}" == "static" ]]; then
+    ldflags+=(-static)
+  fi
+
+  run_logged "sanity-link-audit" tc gcc "${sys[@]}" "${cflags[@]}" \
+    -Wl,-t "${WORK_DIR}/src/link_audit.c" -o "${WORK_DIR}/bin/link_audit" "${ldflags[@]}"
+
+  local logf="${LOG_DIR}/sanity-link-audit.log"
+  [[ -f "${logf}" ]] || die "missing link audit log: ${logf}"
+
+  local bad_re='/(usr/)?lib(64)?/x86_64-linux-gnu/|/lib/x86_64-linux-gnu/|/usr/lib64/|ld-linux-x86-64\.so'
+  if grep -E "${bad_re}" -n "${logf}" >/dev/null 2>&1; then
+    echo
+    echo ">>> sysroot link audit: FAIL (host x86_64 linkage detected)"
+    echo ">>> offending lines:"
+    grep -E "${bad_re}" -n "${logf}" | head -n 80
+    echo
+    die "sysroot purity violated: linker opened host x86_64 files (see ${logf})."
+  fi
+
+  if [[ "${LINK_MODE}" == "static" ]]; then
+    assert_static_elf_clean "${WORK_DIR}/bin/link_audit"
+  fi
+
+  run_logged "sanity-link-audit-inspect" bash -c "
+    set -e
+    file '${WORK_DIR}/bin/link_audit'
+    readelf -l '${WORK_DIR}/bin/link_audit' | grep -E 'Requesting program interpreter' || true
+    readelf -d '${WORK_DIR}/bin/link_audit' | grep -E 'NEEDED' || true
+  "
+}
+
+# ------------------------------ Pi musl runtime staging ------------------------
+copy_first_found() {
+# copy_first_found <destdir> <name1> [name2 ...]
+  if (( $# < 2 )); then
+    echo "ERROR: copy_first_found: expected <destdir> <name...>, got $# args" >&2
+    return 2
+  fi
+
+  local destdir="$1"; shift
+  mkdirp "${destdir}"
+
+  local name path
+  for name in "$@"; do
+    path="$(find -L "${SYSROOT}" -type f -name "${name}" 2>/dev/null | head -n1 || true)"
+    if [[ -n "${path}" ]]; then
+      cp -aL "${path}" "${destdir}/"
+      return 0
+    fi
+  done
+  return 1
+}
+
+stage_pi_musl_runtime_tree() {
+  detect_link_mode
+  [[ "${LINK_MODE}" == "dynamic" ]] || return 0
+
+  local rt="${WORK_DIR}/pi-rt"
+  rm -rf "${rt}"
+  mkdirp "${rt}/lib" "${rt}/usr/lib" "${rt}/etc/ssl/certs"
+
+  if [[ ! -e "${SYSROOT}/lib/ld-musl-aarch64.so.1" ]]; then
+    die "LINK_MODE=dynamic: missing sysroot loader: ${SYSROOT}/lib/ld-musl-aarch64.so.1"
+  fi
+  cp -aL "${SYSROOT}/lib/ld-musl-aarch64.so.1" "${rt}/lib/ld-musl-aarch64.so.1"
+
+  shopt -s nullglob
+  local musl_usr=( "${SYSROOT}/usr/lib/"lib*.so* "${SYSROOT}/usr/lib64/"lib*.so* )
+  local musl_lib=( "${SYSROOT}/lib/"lib*.so* "${SYSROOT}/lib64/"lib*.so* )
+  shopt -u nullglob
+
+  if (( ${#musl_lib[@]} > 0 )); then
+    cp -aL "${musl_lib[@]}" "${rt}/lib/" || true
+  fi
+  if (( ${#musl_usr[@]} > 0 )); then
+    cp -aL "${musl_usr[@]}" "${rt}/usr/lib/" || true
+  fi
+
+  copy_first_found "${rt}/usr/lib" "libc.so" || die "could not find libc.so anywhere under SYSROOT=${SYSROOT}"
+  copy_first_found "${rt}/usr/lib" "libgcc_s.so.1" || die "could not find libgcc_s.so.1 anywhere under SYSROOT=${SYSROOT}"
+  copy_first_found "${rt}/usr/lib" "libstdc++.so.6" || die "could not find libstdc++.so.6 anywhere under SYSROOT=${SYSROOT}"
+
+  copy_first_found "${rt}/usr/lib" \
+    "libatomic.so.1" \
+    "libgomp.so.1" \
+    "libquadmath.so.0" \
+    "libasan.so.8" \
+    "libubsan.so.1" \
+    "liblsan.so.0" \
+    "libtsan.so.2" \
+    "libssp.so.0" || true
+
+  if [[ "${PI_TLS_SELFCONTAINED}" == "1" ]]; then
+    if [[ -f "${SYSROOT}/etc/ssl/certs/ca-certificates.crt" ]]; then
+      cp -aL "${SYSROOT}/etc/ssl/certs/ca-certificates.crt" "${rt}/etc/ssl/certs/ca-certificates.crt"
+    elif [[ -f "${PI_SYSROOT}/etc/ssl/certs/ca-certificates.crt" ]]; then
+      cp -aL "${PI_SYSROOT}/etc/ssl/certs/ca-certificates.crt" "${rt}/etc/ssl/certs/ca-certificates.crt"
+    elif [[ -f "/etc/ssl/certs/ca-certificates.crt" ]]; then
+      cp -aL "/etc/ssl/certs/ca-certificates.crt" "${rt}/etc/ssl/certs/ca-certificates.crt"
+    else
+      echo "WARNING: PI_TLS_SELFCONTAINED=1 but no CA bundle found in SYSROOT, PI_SYSROOT, or host /etc/ssl/certs" >&2
+    fi
+  fi
+
+  {
+    echo "staged_from_sysroot=${SYSROOT}"
+    echo "timestamp_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "--- rt/lib ---"
+    (cd "${rt}/lib" && ls -la) || true
+    echo "--- rt/usr/lib (head) ---"
+    (cd "${rt}/usr/lib" && ls -la | head -n 120) || true
+  } > "${rt}/MANIFEST.txt"
+
+  run_logged "pi-stage-runtime-tree" bash -c "
+    set -e
+    echo 'pi-rt=${rt}'
+    file '${rt}/lib/ld-musl-aarch64.so.1' || true
+    echo 'required dsos:'
+    ls -la '${rt}/usr/lib/libc.so' '${rt}/usr/lib/libgcc_s.so.1' '${rt}/usr/lib/libstdc++.so.6'
+    if [[ -f '${rt}/etc/ssl/certs/ca-certificates.crt' ]]; then
+      echo 'ca-bundle-staged: yes'
+      wc -c '${rt}/etc/ssl/certs/ca-certificates.crt' | awk '{print \$1, \$2}'
+    else
+      echo 'ca-bundle-staged: no'
+    fi
+  "
+}
+
+pack_pi_runtime_tarball() {
+  detect_link_mode
+  [[ "${LINK_MODE}" == "dynamic" ]] || return 0
+
+  have_cmd tar || die "missing tar"
+  local rt="${WORK_DIR}/pi-rt"
+  [[ -d "${rt}" ]] || die "pi runtime tree missing: ${rt} (stage_pi_musl_runtime_tree did not run?)"
+
+  run_logged "pi-pack-runtime-tar" bash -c "
+    set -e
+    cd '${WORK_DIR}'
+    rm -f 'pi-rt.tgz'
+    tar -czf 'pi-rt.tgz' 'pi-rt'
+    ls -la 'pi-rt.tgz'
+  "
+}
+
+# ------------------------------ Test Programs --------------------------------
+write_sources() {
+  mkdirp "${WORK_DIR}/src" "${WORK_DIR}/bin" "${WORK_DIR}/lib"
+
+  cat > "${WORK_DIR}/src/hello.c" <<'EOF'
+#include <stdio.h>
+int main(){ puts("hello-c"); return 0; }
+EOF
+
+  cat > "${WORK_DIR}/src/hello.cpp" <<'EOF'
+#include <iostream>
+int main(){ std::cout << "hello-cpp\n"; return 0; }
+EOF
+
+  cat > "${WORK_DIR}/src/pthread.c" <<'EOF'
+#include <pthread.h>
+#include <stdio.h>
+static void* f(void* p){ (void)p; return (void*)42; }
+int main(){
+  pthread_t t; void* r=0;
+  if(pthread_create(&t,0,f,0)) return 2;
+  pthread_join(t,&r);
+  printf("pthread ok %ld\n",(long)r);
+  return 0;
+}
+EOF
+
+  cat > "${WORK_DIR}/src/except.cpp" <<'EOF'
+#include <iostream>
+#include <stdexcept>
+int main(){
+  try { throw std::runtime_error("boom"); }
+  catch(const std::exception& e){ std::cout << "caught: " << e.what() << "\n"; }
+  return 0;
+}
+EOF
+
+  cat > "${WORK_DIR}/src/atomics.c" <<'EOF'
+#include <stdatomic.h>
+#include <stdio.h>
+int main(){
+  atomic_int x = 0;
+  atomic_fetch_add(&x, 41);
+  atomic_fetch_add(&x, 1);
+  printf("atomics %d\n", atomic_load(&x));
+  return 0;
+}
+EOF
+
+  cat > "${WORK_DIR}/src/dlopen.c" <<'EOF'
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <dlfcn.h>
+#include <stdio.h>
+int main(){
+  void* h = dlopen("libm.so", RTLD_LAZY);
+  if(!h){ puts(dlerror()); return 2; }
+  dlclose(h);
+  puts("dlopen ok");
+  return 0;
+}
+EOF
+
+  cat > "${WORK_DIR}/src/lto1.c" <<'EOF'
+int add(int a,int b){return a+b;}
+EOF
+  cat > "${WORK_DIR}/src/lto2.c" <<'EOF'
+#include <stdio.h>
+int add(int,int);
+int main(){ printf("lto %d\n", add(2,3)); return 0; }
+EOF
+
+  cat > "${WORK_DIR}/src/throwlib.cpp" <<'EOF'
+#include <stdexcept>
+extern "C" void throw_from_dso() {
+  throw std::runtime_error("dso-boom");
+}
+EOF
+
+  cat > "${WORK_DIR}/src/dso_catch.cpp" <<'EOF'
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <dlfcn.h>
+#include <iostream>
+#include <stdexcept>
+
+using fn_t = void (*)();
+
+int main() {
+  void* h = dlopen("./libthrow.so", RTLD_NOW);
+  if (!h) {
+    std::cerr << "dlopen failed: " << dlerror() << "\n";
+    return 2;
+  }
+
+  dlerror();
+  auto sym = dlsym(h, "throw_from_dso");
+  const char* e = dlerror();
+  if (e) {
+    std::cerr << "dlsym failed: " << e << "\n";
+    return 3;
+  }
+
+  try {
+    reinterpret_cast<fn_t>(sym)();
+    std::cerr << "ERROR: did not throw\n";
+    return 4;
+  } catch (const std::exception& ex) {
+    std::cout << "caught-from-dso: " << ex.what() << "\n";
+  }
+
+  dlclose(h);
+  return 0;
+}
+EOF
+
+  cat > "${WORK_DIR}/src/dlopen_threads.cpp" <<'EOF'
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <dlfcn.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+static int g_iters = 200;
+
+static void* worker(void* arg){
+  const char* so = (const char*)arg;
+  for(int i=0;i<g_iters;i++){
+    void* h = dlopen(so, RTLD_NOW);
+    if(!h){
+      const char* e = dlerror();
+      fprintf(stderr, "dlopen fail: %s\n", e ? e : "(null)");
+      return (void*)1;
+    }
+    dlerror();
+    void* sym = dlsym(h, "throw_from_dso");
+    (void)sym;
+    dlclose(h);
+  }
+  return 0;
+}
+
+int main(int argc, char** argv){
+  int threads = 4;
+  const char* so = "./libthrow.so";
+  if(argc > 1) threads = atoi(argv[1]);
+  if(argc > 2) g_iters = atoi(argv[2]);
+  if(argc > 3) so = argv[3];
+
+  if(threads < 1) threads = 1;
+  if(g_iters < 1) g_iters = 1;
+
+  pthread_t* ts = (pthread_t*)calloc((size_t)threads, sizeof(pthread_t));
+  if(!ts){ perror("calloc"); return 2; }
+
+  for(int i=0;i<threads;i++){
+    if(pthread_create(&ts[i], 0, worker, (void*)so)){
+      fprintf(stderr, "pthread_create failed\n");
+      return 3;
+    }
+  }
+  int bad = 0;
+  for(int i=0;i<threads;i++){
+    void* r = 0;
+    pthread_join(ts[i], &r);
+    if(r) bad = 1;
+  }
+  free(ts);
+
+  if(bad){
+    fprintf(stderr, "dlopen-thread-stress: FAIL\n");
+    return 5;
+  }
+  printf("dlopen-thread-stress: ok threads=%d iters=%d so=%s\n", threads, g_iters, so);
+  return 0;
+}
+EOF
+
+  cat > "${WORK_DIR}/src/sym_a.c" <<'EOF'
+int magic(){ return 111; }
+EOF
+  cat > "${WORK_DIR}/src/sym_b.c" <<'EOF'
+int magic(){ return 222; }
+EOF
+  cat > "${WORK_DIR}/src/rtld_collision.c" <<'EOF'
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <dlfcn.h>
+#include <stdio.h>
+
+typedef int (*fn_t)();
+
+int main(){
+  void* a = dlopen("./libsym_a.so", RTLD_NOW | RTLD_GLOBAL);
+  if(!a){ fprintf(stderr, "dlopen A: %s\n", dlerror()); return 2; }
+
+  void* b = dlopen("./libsym_b.so", RTLD_NOW | RTLD_LOCAL);
+  if(!b){ fprintf(stderr, "dlopen B: %s\n", dlerror()); return 3; }
+
+  dlerror();
+  fn_t f_def = (fn_t)dlsym(RTLD_DEFAULT, "magic");
+  const char* e1 = dlerror();
+  if(e1){ fprintf(stderr, "dlsym default: %s\n", e1); return 4; }
+
+  dlerror();
+  fn_t f_b = (fn_t)dlsym(b, "magic");
+  const char* e2 = dlerror();
+  if(e2){ fprintf(stderr, "dlsym b: %s\n", e2); return 5; }
+
+  int v_def = f_def ? f_def() : -1;
+  int v_b   = f_b   ? f_b()   : -1;
+
+  printf("rtld-collision: default=%d b=%d\n", v_def, v_b);
+
+  if(v_def != 111 || v_b != 222){
+    fprintf(stderr, "rtld-collision: FAIL expected default=111 and b=222\n");
+    return 6;
+  }
+
+  dlclose(b);
+  dlclose(a);
+  printf("rtld-collision: ok\n");
+  return 0;
+}
+EOF
+
+  cat > "${WORK_DIR}/src/abi_string.cpp" <<'EOF'
+#include <iostream>
+#include <string>
+#include <vector>
+#include <numeric>
+
+static std::string make() {
+  std::vector<int> v(1000);
+  std::iota(v.begin(), v.end(), 1);
+  long long s = std::accumulate(v.begin(), v.end(), 0LL);
+  return std::string("abi-string-ok:") + std::to_string(s);
+}
+
+int main(){
+  std::cout << make() << "\n";
+  return 0;
+}
+EOF
+}
+
+build_binaries() {
+  detect_link_mode
+
+  local cflags=(-O2)
+  local sys=(--sysroot="${SYSROOT}")
+
+  local ldflags=()
+  local cxx_ldflags=()
+  if [[ "${LINK_MODE}" == "static" ]]; then
+    ldflags+=(-static)
+    cxx_ldflags+=(-static -static-libgcc -static-libstdc++)
+  fi
+
+  run_logged "build-hello-c"   tc gcc "${sys[@]}" "${cflags[@]}" "${WORK_DIR}/src/hello.c"   -o "${WORK_DIR}/bin/hello_c" "${ldflags[@]}"
+  run_logged "build-hello-cpp" tc g++ "${sys[@]}" "${cflags[@]}" "${WORK_DIR}/src/hello.cpp" -o "${WORK_DIR}/bin/hello_cpp" "${cxx_ldflags[@]}"
+
+  run_logged "build-pthread" tc gcc "${sys[@]}" "${cflags[@]}" "${WORK_DIR}/src/pthread.c" -o "${WORK_DIR}/bin/pthread" -pthread "${ldflags[@]}"
+  run_logged "build-except"  tc g++ "${sys[@]}" "${cflags[@]}" "${WORK_DIR}/src/except.cpp" -o "${WORK_DIR}/bin/except" "${cxx_ldflags[@]}"
+  run_logged "build-atomics" tc gcc "${sys[@]}" "${cflags[@]}" "${WORK_DIR}/src/atomics.c" -o "${WORK_DIR}/bin/atomics" "${ldflags[@]}"
+  run_logged "build-lto"     tc gcc "${sys[@]}" "${cflags[@]}" -flto \
+    "${WORK_DIR}/src/lto1.c" "${WORK_DIR}/src/lto2.c" -o "${WORK_DIR}/bin/lto_test" "${ldflags[@]}"
+
+  if [[ "${STRESS_LIBSTDCPP_ABI}" == "1" ]]; then
+    run_logged "build-abi-string" tc g++ "${sys[@]}" "${cflags[@]}" \
+      "${WORK_DIR}/src/abi_string.cpp" -o "${WORK_DIR}/bin/abi_string" "${cxx_ldflags[@]}"
+  fi
+
+  if [[ "${LINK_MODE}" == "dynamic" ]]; then
+    run_logged "build-dlopen"  tc gcc "${sys[@]}" "${cflags[@]}" "${WORK_DIR}/src/dlopen.c" -o "${WORK_DIR}/bin/dlopen" -ldl
+
+    run_logged "build-libthrow" tc g++ "${sys[@]}" "${cflags[@]}" -fPIC -shared \
+      -Wl,-soname,libthrow.so \
+      "${WORK_DIR}/src/throwlib.cpp" -o "${WORK_DIR}/lib/libthrow.so"
+
+    run_logged "build-dso-catch" tc g++ "${sys[@]}" "${cflags[@]}" \
+      "${WORK_DIR}/src/dso_catch.cpp" -o "${WORK_DIR}/bin/dso_catch" \
+      -ldl -Wl,-rpath,'$ORIGIN/../lib'
+
+    run_logged "build-libthrow-symlink" bash -c "
+      set -e
+      ln -sf ../lib/libthrow.so '${WORK_DIR}/bin/libthrow.so'
+      ls -l '${WORK_DIR}/bin/libthrow.so'
+    "
+
+    run_logged "build-dlopen-threads" tc g++ "${sys[@]}" "${cflags[@]}" \
+      "${WORK_DIR}/src/dlopen_threads.cpp" -o "${WORK_DIR}/bin/dlopen_threads" \
+      -ldl -pthread -Wl,-rpath,'$ORIGIN/../lib'
+
+    run_logged "build-libsym-a" tc gcc "${sys[@]}" "${cflags[@]}" -fPIC -shared \
+      -Wl,-soname,libsym_a.so \
+      "${WORK_DIR}/src/sym_a.c" -o "${WORK_DIR}/lib/libsym_a.so"
+
+    run_logged "build-libsym-b" tc gcc "${sys[@]}" "${cflags[@]}" -fPIC -shared \
+      -Wl,-soname,libsym_b.so \
+      "${WORK_DIR}/src/sym_b.c" -o "${WORK_DIR}/lib/libsym_b.so"
+
+    run_logged "build-rtld-collision" tc gcc "${sys[@]}" "${cflags[@]}" \
+      "${WORK_DIR}/src/rtld_collision.c" -o "${WORK_DIR}/bin/rtld_collision" \
+      -ldl -Wl,-rpath,'$ORIGIN/../lib'
+
+    run_logged "build-symlink-sym-a" bash -c "set -e; ln -sf ../lib/libsym_a.so '${WORK_DIR}/bin/libsym_a.so'; ls -l '${WORK_DIR}/bin/libsym_a.so'"
+    run_logged "build-symlink-sym-b" bash -c "set -e; ln -sf ../lib/libsym_b.so '${WORK_DIR}/bin/libsym_b.so'; ls -l '${WORK_DIR}/bin/libsym_b.so'"
+
+    if [[ "${STRESS_STRIP_VERIFY}" == "1" ]]; then
+      run_logged "strip-verify" bash -c "
+        set -e
+        cp -a '${WORK_DIR}/bin/hello_c' '${WORK_DIR}/bin/hello_c.stripped'
+        '${TC_PREFIX}/bin/${TARGET}-strip' '${WORK_DIR}/bin/hello_c.stripped' || true
+        '${QEMU_AARCH64}' -L '${SYSROOT}' '${WORK_DIR}/bin/hello_c.stripped' >/dev/null
+        echo 'strip-verify: ok'
+      "
+    fi
+  else
+    log "LINK_MODE=static: skipping dlopen/DSO/rtld collision builds"
+  fi
+}
+
+# ------------------------------ Stress C++ -----------------------------------
+stress_cpp_compile() {
+  mkdirp "${WORK_DIR}/src" "${WORK_DIR}/bin"
+  cat > "${WORK_DIR}/src/stress.cpp" <<'EOF'
+#include <algorithm>
+#include <functional>
+#include <iostream>
+#include <map>
+#include <numeric>
+#include <optional>
+#include <random>
+#include <string>
+#include <type_traits>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+template <typename T>
+struct Box { T value; constexpr Box(T v) : value(v) {} constexpr T get() const { return value; } };
+
+template <typename... Ts>
+constexpr auto fold_sum(Ts... xs) { return (xs + ... + 0); }
+
+static inline int run() {
+  std::vector<int> v(5000);
+  std::iota(v.begin(), v.end(), 1);
+  std::shuffle(v.begin(), v.end(), std::mt19937{123});
+  std::sort(v.begin(), v.end());
+  auto s = std::accumulate(v.begin(), v.end(), 0);
+
+  std::map<std::string,int> m;
+  m["sum"] = s;
+
+  std::optional<int> o = m["sum"];
+  if (!o) return 2;
+
+  constexpr Box<int> b(7);
+  static_assert(b.get() == 7);
+
+  constexpr auto z = fold_sum(1,2,3,4,5);
+  static_assert(z == 15);
+
+  return (o.value() == (5000*5001)/2) ? 0 : 3;
+}
+
+int main(){ return run(); }
+EOF
+
+  detect_link_mode
+  local extra=()
+  if [[ "${LINK_MODE}" == "static" ]]; then
+    extra+=(-static -static-libgcc -static-libstdc++)
+  fi
+
+  run_logged "stress-cpp-build" tc g++ --sysroot="${SYSROOT}" -O2 -std=gnu++20 \
+    "${WORK_DIR}/src/stress.cpp" -o "${WORK_DIR}/bin/stress_cpp" "${extra[@]}"
+}
+
+stress_lto_matrix() {
+  [[ "${STRESS_LTO_MATRIX}" == "1" ]] || return 0
+  mkdirp "${WORK_DIR}/bin"
+
+  detect_link_mode
+  local sys=(--sysroot="${SYSROOT}")
+  local base=(-O2)
+  local ldflags=()
+  if [[ "${LINK_MODE}" == "static" ]]; then ldflags+=(-static); fi
+
+  run_logged "stress-lto" tc gcc "${sys[@]}" "${base[@]}" -flto \
+    "${WORK_DIR}/src/lto1.c" "${WORK_DIR}/src/lto2.c" -o "${WORK_DIR}/bin/lto" "${ldflags[@]}"
+  run_logged "qemu-run-lto" qemu_run "${WORK_DIR}/bin/lto"
+
+  run_logged "stress-lto-jobs" tc gcc "${sys[@]}" "${base[@]}" -flto="${JOBS}" \
+    "${WORK_DIR}/src/lto1.c" "${WORK_DIR}/src/lto2.c" -o "${WORK_DIR}/bin/lto_jobs" "${ldflags[@]}"
+  run_logged "qemu-run-lto-jobs" qemu_run "${WORK_DIR}/bin/lto_jobs"
+}
+
+# ------------------------------ Integration Builds ----------------------------
+integration_prepare() {
+  detect_link_mode
+  [[ "${LINK_MODE}" == "dynamic" ]] || die "integration suite requires LINK_MODE=dynamic"
+  have_cmd tar || die "missing tar"
+  have_cmd make || die "missing make"
+  mkdirp "${TARBALL_DIR}" "${SRC_DIR}" "${BUILD_DIR}" "${INSTALL_DIR}"
+}
+
+export_integration_env() {
+  export CC="${TC_PREFIX}/bin/${TARGET}-gcc"
+  export CXX="${TC_PREFIX}/bin/${TARGET}-g++"
+  export AR="${TC_PREFIX}/bin/${TARGET}-ar"
+  export RANLIB="${TC_PREFIX}/bin/${TARGET}-ranlib"
+  export STRIP="${TC_PREFIX}/bin/${TARGET}-strip"
+  export LD="${TC_PREFIX}/bin/${TARGET}-ld"
+  export CFLAGS="${CFLAGS:--O2 -pipe} --sysroot=${SYSROOT}"
+  export CXXFLAGS="${CXXFLAGS:--O2 -pipe} --sysroot=${SYSROOT}"
+  export LDFLAGS="${LDFLAGS:-} --sysroot=${SYSROOT}"
+
+  export PKG_CONFIG_SYSROOT_DIR="${SYSROOT}"
+  export PKG_CONFIG_LIBDIR="${SYSROOT}/usr/lib/pkgconfig:${SYSROOT}/usr/share/pkgconfig:${INSTALL_DIR}/lib/pkgconfig:${INSTALL_DIR}/share/pkgconfig"
+  export PKG_CONFIG_PATH="${INSTALL_DIR}/lib/pkgconfig:${INSTALL_DIR}/share/pkgconfig"
+}
+
+integration_stage_ca_bundle() {
+  [[ "${PI_TLS_SELFCONTAINED}" == "1" ]] || return 0
+
+  local dest="${INSTALL_DIR}/ssl/certs/ca-certificates.crt"
+  mkdirp "$(dirname "${dest}")"
+
+  local sys_ca="${SYSROOT}/etc/ssl/certs/ca-certificates.crt"
+  local pi_ca="${PI_SYSROOT}/etc/ssl/certs/ca-certificates.crt"
+  local host_ca="/etc/ssl/certs/ca-certificates.crt"
+
+  if [[ -s "${sys_ca}" ]]; then
+    run_logged "integration-stage-ca-bundle" bash -c "
+      set -e
+      cp -f '${sys_ca}' '${dest}'
+      echo 'staged_ca_bundle_src=${sys_ca}'
+      echo 'staged_ca_bundle_dest=${dest}'
+      wc -c '${dest}' | awk '{print \$1, \$2}'
+    "
+    return 0
+  fi
+
+  if [[ -s "${pi_ca}" ]]; then
+    run_logged "integration-stage-ca-bundle" bash -c "
+      set -e
+      cp -f '${pi_ca}' '${dest}'
+      echo 'staged_ca_bundle_src=${pi_ca}'
+      echo 'staged_ca_bundle_dest=${dest}'
+      wc -c '${dest}' | awk '{print \$1, \$2}'
+    "
+    return 0
+  fi
+
+  if [[ -s "${host_ca}" ]]; then
+    run_logged "integration-stage-ca-bundle" bash -c "
+      set -e
+      cp -f '${host_ca}' '${dest}'
+      echo 'staged_ca_bundle_src=${host_ca}'
+      echo 'staged_ca_bundle_dest=${dest}'
+      wc -c '${dest}' | awk '{print \$1, \$2}'
+    "
+    return 0
+  fi
+
+  run_logged "integration-stage-ca-bundle" bash -c "
+    set -e
+    echo 'No CA bundle found in SYSROOT, PI_SYSROOT, or host /etc/ssl/certs.'
+    echo 'Falling back to download: ${CA_BUNDLE_URL}'
+  "
+
+  download_try "${dest}" "${CA_BUNDLE_URL}"
+
+  run_logged "integration-stage-ca-bundle-verify" bash -c "
+    set -e
+    test -s '${dest}'
+    grep -m1 'BEGIN CERTIFICATE' '${dest}' >/dev/null 2>&1 || { echo 'ERROR: staged CA bundle missing PEM header'; exit 2; }
+    echo 'staged_ca_bundle_dest=${dest}'
+    wc -c '${dest}' | awk '{print \$1, \$2}'
+  "
+}
+
+integration_zlib() {
+  integration_prepare
+  export_integration_env
+
+  local tb="${TARBALL_DIR}/zlib-${ZLIB_VER}.tarball"
+  local src="${SRC_DIR}/zlib-${ZLIB_VER}"
+
+  download_try "${tb}" \
+    "https://zlib.net/zlib-${ZLIB_VER}.tar.xz" \
+    "https://zlib.net/zlib-${ZLIB_VER}.tar.gz" \
+    "https://zlib.net/fossils/zlib-${ZLIB_VER}.tar.gz" \
+    "https://github.com/madler/zlib/releases/download/v${ZLIB_VER}/zlib-${ZLIB_VER}.tar.xz" \
+    "https://github.com/madler/zlib/releases/download/v${ZLIB_VER}/zlib-${ZLIB_VER}.tar.gz"
+
+  [[ -d "${src}" && -f "${src}/configure" ]] || extract "${tb}" "${src}"
+
+  run_logged "integration-zlib-configure" bash -c "
+    set -e
+    cd '${src}'
+    ./configure --prefix='${INSTALL_DIR}'
+  "
+  run_logged "integration-zlib-build" bash -c "set -e; cd '${src}'; make -j'${JOBS}'"
+  run_logged "integration-zlib-install" bash -c "set -e; cd '${src}'; make install"
+}
+
+integration_openssl() {
+  integration_prepare
+  export_integration_env
+
+  local tb="${TARBALL_DIR}/openssl-${OPENSSL_VER}.tar.gz"
+  local src="${SRC_DIR}/openssl-${OPENSSL_VER}"
+  download "${OPENSSL_URL}" "${tb}"
+  [[ -d "${src}" && -f "${src}/Configure" ]] || extract "${tb}" "${src}"
+
+  run_logged "integration-openssl-configure" bash -c "
+    set -e
+    cd '${src}'
+    ./Configure linux-aarch64 \
+      --prefix='${INSTALL_DIR}' \
+      --openssldir='${INSTALL_DIR}/ssl' \
+      no-tests
+  "
+  run_logged "integration-openssl-build" bash -c "set -e; cd '${src}'; make -j'${JOBS}'"
+  run_logged "integration-openssl-install" bash -c "set -e; cd '${src}'; make install_sw"
+}
+
+integration_curl() {
+  integration_prepare
+  export_integration_env
+
+  local tb="${TARBALL_DIR}/curl-${CURL_VER}.tar.gz"
+  local src="${SRC_DIR}/curl-${CURL_VER}"
+  download "${CURL_URL}" "${tb}"
+  [[ -d "${src}" && -f "${src}/configure" ]] || extract "${tb}" "${src}"
+
+  local extra_opts=()
+  if [[ "${CURL_DISABLE_LIBPSL}" == "1" ]]; then extra_opts+=(--without-libpsl); fi
+  if [[ "${CURL_DISABLE_BROTLI}" == "1" ]]; then extra_opts+=(--without-brotli); fi
+
+  local ca_bundle_opt="--with-ca-bundle=/etc/ssl/certs/ca-certificates.crt"
+  local ca_path_opt="--with-ca-path=/etc/ssl/certs"
+  if [[ "${PI_TLS_SELFCONTAINED}" == "1" ]]; then
+    ca_bundle_opt="--with-ca-bundle=${INSTALL_DIR}/ssl/certs/ca-certificates.crt"
+    ca_path_opt="--with-ca-path=${INSTALL_DIR}/ssl/certs"
+  fi
+
+  run_logged "integration-curl-configure" bash -c "
+    set -e
+    cd '${src}'
+    export CPPFLAGS='-I${INSTALL_DIR}/include'
+    export LDFLAGS='${LDFLAGS} -L${INSTALL_DIR}/lib'
+    ./configure \
+      --host='${TARGET}' \
+      --prefix='${INSTALL_DIR}' \
+      --with-sysroot='${SYSROOT}' \
+      --with-zlib='${INSTALL_DIR}' \
+      --with-openssl='${INSTALL_DIR}' \
+      ${ca_bundle_opt} \
+      ${ca_path_opt} \
+      ${extra_opts[*]} \
+      --disable-manual \
+      --disable-debug \
+      --enable-shared \
+      --disable-static
+  "
+  run_logged "integration-curl-build" bash -c "set -e; cd '${src}'; make -j'${JOBS}'"
+  run_logged "integration-curl-install" bash -c "set -e; cd '${src}'; make install"
+}
+
+_fixup_runpath_for_bin() {
+  local name="$1"
+  local bin="$2"
+  [[ -x "${bin}" ]] || die "${name} binary not found at: ${bin}"
+  have_cmd readelf || die "missing readelf"
+  have_cmd grep || die "missing grep"
+
+  local wanted_runpath='$ORIGIN/../lib:$ORIGIN/../lib64'
+
+  run_logged "${name}" bash -c "
+    set -e
+    echo 'before:'
+    readelf -d '${bin}' | grep -E 'RPATH|RUNPATH' || true
+  "
+
+  if have_cmd patchelf; then
+    patchelf --set-rpath "${wanted_runpath}" "${bin}"
+  elif have_cmd chrpath; then
+    chrpath -r "${wanted_runpath}" "${bin}"
+  else
+    echo "ERROR: need patchelf or chrpath on host to fix RPATH/RUNPATH" >&2
+    return 2
+  fi
+
+  run_logged "${name}-after" bash -c "
+    set -e
+    echo 'after:'
+    readelf -d '${bin}' | grep -E 'RPATH|RUNPATH' || true
+  "
+}
+
+integration_fixup_curl_rpath() {
+  _fixup_runpath_for_bin "integration-fixup-curl-rpath" "${INSTALL_DIR}/bin/curl"
+}
+
+integration_fixup_openssl_rpath() {
+  _fixup_runpath_for_bin "integration-fixup-openssl-rpath" "${INSTALL_DIR}/bin/openssl"
+}
+
+# ------------------------------ TLS postcheck (NO bash -c quoting) -------------
+_tls_candidates() {
+  # precedence:
+  #   TLS_CA_BUNDLE (if set) -> staged -> PI_SYSROOT -> host
+  local forced="${TLS_CA_BUNDLE:-}"
+  local staged="${INSTALL_DIR}/ssl/certs/ca-certificates.crt"
+  local pi_ca="${PI_SYSROOT}/etc/ssl/certs/ca-certificates.crt"
+  local host_ca="/etc/ssl/certs/ca-certificates.crt"
+
+  if [[ -n "${forced}" ]]; then
+    echo "${forced}"
+    return 0
+  fi
+  echo "${staged}"
+  echo "${pi_ca}"
+  echo "${host_ca}"
+}
+
+_tls_try_one() {
+  # _tls_try_one <ca_file> <curl_bin>
+  local ca="$1"
+  local curl_bin="$2"
+
+  local tmp
+  tmp="$(mktemp)"
+  local capath
+  capath="$(dirname "${ca}")"
+
+  local capath_args=()
+  [[ -d "${capath}" ]] && capath_args+=(--capath "${capath}")
+
+  set +e
+  CURL_CA_BUNDLE="${ca}" SSL_CERT_FILE="${ca}" \
+    "${QEMU_AARCH64}" -L "${SYSROOT}" "${curl_bin}" \
+      -vI --max-time 15 --cacert "${ca}" "${capath_args[@]}" "${PI_NET_TEST_URL}" \
+      2>&1 | sed -n '1,140p' > "${tmp}"
+  local st_curl=${PIPESTATUS[0]}
+  set -e
+
+  # print transcript exactly once
+  cat "${tmp}"
+
+  if [[ "${st_curl}" -ne 0 ]]; then
+    echo "(curl exit=${st_curl})"
+    rm -f "${tmp}"
+    return 2
+  fi
+
+  if ! grep -E '^(< )?HTTP/' "${tmp}" >/dev/null 2>&1; then
+    echo "(warning: no HTTP status line observed in truncated output)"
+  fi
+
+  rm -f "${tmp}"
+  return 0
+}
+
+postcheck_qemu_curl_tls() {
+  # expects globals: INSTALL_DIR, QEMU_AARCH64, SYSROOT, PI_SYSROOT, PI_NET_TEST_URL
+  local curl_bin="${INSTALL_DIR}/bin/curl"
+
+  local ok=0
+  local chosen=""
+
+  while IFS= read -r cand; do
+    [[ -n "${cand}" ]] || continue
+    echo "---"
+    echo "Trying CA bundle: ${cand}"
+    if _tls_try_one "${cand}" "${curl_bin}"; then
+      ok=1
+      chosen="${cand}"
+      break
+    else
+      echo "(failed with CA: ${cand})"
+    fi
+  done < <(_tls_candidates)
+
+  if [[ "${ok}" != "1" ]]; then
+    echo
+    echo "ERROR: TLS postcheck failed with all CA bundle candidates."
+    echo "Tried (in order):"
+    _tls_candidates | sed 's/^/  - /'
+    echo
+    echo "Hints:"
+    echo "  - If you are behind HTTPS inspection, set TLS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt"
+    echo "  - Or point TLS_CA_BUNDLE at the enterprise root bundle you trust."
+    return 60
+  fi
+
+  echo
+  echo "TLS postcheck: PASS using CA bundle: ${chosen}"
+  return 0
+}
+
+postcheck_integration_artifacts() {
+  detect_link_mode
+  [[ "${LINK_MODE}" == "dynamic" ]] || return 0
+
+  have_cmd readelf || die "missing readelf"
+
+  local curl_bin="${INSTALL_DIR}/bin/curl"
+  local openssl_bin="${INSTALL_DIR}/bin/openssl"
+  local libdir="${INSTALL_DIR}/lib"
+
+  run_logged "postcheck-curl-needed-exists" bash -c "
+    set -e
+    echo 'curl NEEDED:'
+    readelf -d '${curl_bin}' | grep -E 'NEEDED' | sed -E 's/.*\\[(.*)\\].*/\\1/' || true
+    echo
+    for so in libcurl.so.4 libssl.so.3 libcrypto.so.3 libz.so.1; do
+      test -e '${libdir}/'\"\$so\" || { echo 'missing: ${libdir}/'\"\$so\"; exit 2; }
+      ls -l '${libdir}/'\"\$so\"
+    done
+  "
+
+  run_logged "postcheck-qemu-openssl-version" bash -c "
+    set -e
+    '${QEMU_AARCH64}' -L '${SYSROOT}' '${openssl_bin}' version -a
+  "
+
+  run_logged "postcheck-qemu-curl-version" bash -c "
+    set -e
+    '${QEMU_AARCH64}' -L '${SYSROOT}' '${curl_bin}' --version
+  "
+
+  if [[ "${PI_NET_TEST}" == "1" ]]; then
+    run_logged "postcheck-qemu-curl-tls" postcheck_qemu_curl_tls
+  else
+    log "PI_NET_TEST=0: skipping TLS postcheck"
+  fi
+}
+
+run_integration_suite() {
+  log "INTEGRATION=1: running integration builds (zlib -> openssl -> curl)"
+  integration_zlib
+  integration_openssl
+  integration_stage_ca_bundle
+  integration_curl
+  integration_fixup_curl_rpath
+  integration_fixup_openssl_rpath
+  postcheck_integration_artifacts
+  log "INTEGRATION: PASS"
+}
+
+# ------------------------------ Tiers -----------------------------------------
+tier_report() {
+  mark_tier_start "report"
+  need_paths
+  mkdirp "${LOG_DIR}"
+
+  run_logged "report" bash -c "
+    set -e
+    echo 'Toolchain test script: ${SCRIPT_VERSION}'
+    echo
+    echo 'TC_PREFIX=${TC_PREFIX}'
+    echo 'TARGET=${TARGET}'
+    echo 'SYSROOT=${SYSROOT}'
+    echo 'LINK_MODE=${LINK_MODE}'
+    echo 'A_PLUS=${A_PLUS}'
+    echo
+    echo '--- gcc -v (Configured with) ---'
+    '${TC_PREFIX}/bin/${TARGET}-gcc' -v 2>&1 | sed -n '/Configured with:/,/Thread model:/p'
+    echo
+    echo '--- gcc search dirs ---'
+    '${TC_PREFIX}/bin/${TARGET}-gcc' -print-search-dirs
+    echo
+    echo '--- sysroot lib dir ---'
+    ls -l '${SYSROOT}/lib' || true
+    echo
+    echo '--- qemu ---'
+    command -v '${QEMU_AARCH64}' >/dev/null 2>&1 && '${QEMU_AARCH64}' --version | head -n 1 || echo '(qemu not installed)'
+    echo
+    echo '--- integration toggles ---'
+    echo 'INTEGRATION=${INTEGRATION}'
+    echo 'INTEGRATION_RUN_ON_PI=${INTEGRATION_RUN_ON_PI}'
+    echo 'PI_NET_TEST=${PI_NET_TEST}'
+    echo 'PI_NET_TEST_URL=${PI_NET_TEST_URL}'
+    echo 'PI_TLS_SELFCONTAINED=${PI_TLS_SELFCONTAINED}'
+    echo 'CA_BUNDLE_URL=${CA_BUNDLE_URL}'
+    echo 'PI_SYSROOT=${PI_SYSROOT}'
+    echo
+    echo '--- stress toggles ---'
+    echo 'STRESS_CPP=${STRESS_CPP}'
+    echo 'STRESS_DLOPEN_THREADS=${STRESS_DLOPEN_THREADS}'
+    echo 'STRESS_DLOPEN_THREADS_N=${STRESS_DLOPEN_THREADS_N}'
+    echo 'STRESS_DLOPEN_ITERS=${STRESS_DLOPEN_ITERS}'
+    echo 'STRESS_RTLD_COLLISION=${STRESS_RTLD_COLLISION}'
+    echo 'STRESS_OPENSSL_TLS=${STRESS_OPENSSL_TLS}'
+    echo 'STRESS_LTO_MATRIX=${STRESS_LTO_MATRIX}'
+    echo 'STRESS_STRIP_VERIFY=${STRESS_STRIP_VERIFY}'
+    echo 'STRESS_LIBSTDCPP_ABI=${STRESS_LIBSTDCPP_ABI}'
+    echo
+    echo 'SYSROOT_LINK_AUDIT=${SYSROOT_LINK_AUDIT}'
+  "
+
+  mark_tier_pass "report"
+  tier_summary
+}
+
+tier_sanity() {
+  mark_tier_start "sanity"
+  need_paths
+  need_qemu
+  mkdirp "${WORK_DIR}"
+  write_sources
+
+  run_logged "provenance-gcc" bash -c "
+    set -e
+    '${TC_PREFIX}/bin/${TARGET}-gcc' -v 2>&1 | sed -n '/Configured with:/,/Thread model:/p'
+    echo
+    '${TC_PREFIX}/bin/${TARGET}-gcc' -print-sysroot
+    echo
+    '${TC_PREFIX}/bin/${TARGET}-gcc' -print-search-dirs
+    echo
+    '${TC_PREFIX}/bin/${TARGET}-ld' --version | head -n 2 || true
+  "
+
+  sysroot_link_audit
+
+  build_binaries
+  inspect_elf "${WORK_DIR}/bin/hello_c"
+  inspect_elf "${WORK_DIR}/bin/hello_cpp"
+
+  assert_static_elf_clean "${WORK_DIR}/bin/hello_c"
+  assert_static_elf_clean "${WORK_DIR}/bin/hello_cpp"
+
+  run_logged "qemu-run-hello-c"   qemu_run "${WORK_DIR}/bin/hello_c"
+  run_logged "qemu-run-hello-cpp" qemu_run "${WORK_DIR}/bin/hello_cpp"
+
+  mark_tier_pass "sanity"
+  tier_summary
+}
+
+tier_smoke() {
+  mark_tier_start "smoke"
+  need_paths
+  need_qemu
+  mkdirp "${WORK_DIR}"
+  write_sources
+  build_binaries
+
+  if [[ "${STRESS_CPP}" == "1" ]]; then
+    stress_cpp_compile
+    assert_static_elf_clean "${WORK_DIR}/bin/stress_cpp"
+    run_logged "qemu-run-stress-cpp" qemu_run "${WORK_DIR}/bin/stress_cpp"
+  fi
+
+  stress_lto_matrix
+
+  assert_static_elf_clean "${WORK_DIR}/bin/pthread"
+  assert_static_elf_clean "${WORK_DIR}/bin/except"
+  assert_static_elf_clean "${WORK_DIR}/bin/atomics"
+  assert_static_elf_clean "${WORK_DIR}/bin/lto_test"
+
+  run_logged "qemu-run-pthread" qemu_run "${WORK_DIR}/bin/pthread"
+  run_logged "qemu-run-except"  qemu_run "${WORK_DIR}/bin/except"
+  run_logged "qemu-run-atomics" qemu_run "${WORK_DIR}/bin/atomics"
+  run_logged "qemu-run-lto"     qemu_run "${WORK_DIR}/bin/lto_test"
+
+  if [[ "${STRESS_LIBSTDCPP_ABI}" == "1" ]]; then
+    run_logged "qemu-run-abi-string" qemu_run "${WORK_DIR}/bin/abi_string"
+  fi
+
+  if [[ "${LINK_MODE}" == "dynamic" ]]; then
+    run_logged "qemu-run-dlopen"  qemu_run "${WORK_DIR}/bin/dlopen"
+
+    inspect_elf "${WORK_DIR}/bin/dso_catch"
+    run_logged "qemu-run-dso-catch" bash -c "
+      set -e
+      cd '${WORK_DIR}/bin'
+      '${QEMU_AARCH64}' -L '${SYSROOT}' './dso_catch'
+    "
+
+    if [[ "${STRESS_DLOPEN_THREADS}" == "1" ]]; then
+      run_logged "qemu-run-dlopen-threads" bash -c "
+        set -e
+        cd '${WORK_DIR}/bin'
+        '${QEMU_AARCH64}' -L '${SYSROOT}' './dlopen_threads' '${STRESS_DLOPEN_THREADS_N}' '${STRESS_DLOPEN_ITERS}' './libthrow.so'
+      "
+    fi
+
+    if [[ "${STRESS_RTLD_COLLISION}" == "1" ]]; then
+      run_logged "qemu-run-rtld-collision" bash -c "
+        set -e
+        cd '${WORK_DIR}/bin'
+        '${QEMU_AARCH64}' -L '${SYSROOT}' './rtld_collision'
+      "
+    fi
+  else
+    log "LINK_MODE=static: skipping dlopen/DSO/rtld runtime tests"
+  fi
+
+  mark_tier_pass "smoke"
+  tier_summary
+}
+
+tier_nightly() {
+  mark_tier_start "nightly"
+  need_paths
+  mkdirp "${WORK_DIR}"
+  write_sources
+  build_binaries
+
+  assert_static_elf_clean "${WORK_DIR}/bin/hello_c"
+  assert_static_elf_clean "${WORK_DIR}/bin/hello_cpp"
+  assert_static_elf_clean "${WORK_DIR}/bin/pthread"
+  assert_static_elf_clean "${WORK_DIR}/bin/except"
+  assert_static_elf_clean "${WORK_DIR}/bin/atomics"
+  assert_static_elf_clean "${WORK_DIR}/bin/lto_test"
+
+  have_cmd ssh || die "missing ssh"
+  have_cmd scp || die "missing scp"
+  have_cmd tar || die "missing tar"
+
+  run_logged "pi-prepare" ssh -p "${PI_SSH_PORT}" "${PI_SSH}" "mkdir -p '${PI_TMPDIR}' && rm -rf '${PI_TMPDIR}'/*"
+
+  run_logged "pi-copy-bins" bash -c "
+    set -e
+    scp -P '${PI_SSH_PORT}' '${WORK_DIR}/bin/'* '${PI_SSH}:${PI_TMPDIR}/'
+    if [[ '${LINK_MODE}' == 'dynamic' ]]; then
+      scp -P '${PI_SSH_PORT}' '${WORK_DIR}/lib/'*.so '${PI_SSH}:${PI_TMPDIR}/' || true
+    fi
+  "
+
+  if [[ "${LINK_MODE}" == "dynamic" ]]; then
+    stage_pi_musl_runtime_tree
+    pack_pi_runtime_tarball
+
+    run_logged "pi-copy-runtime" bash -c "
+      set -e
+      scp -P '${PI_SSH_PORT}' '${WORK_DIR}/pi-rt.tgz' '${PI_SSH}:${PI_TMPDIR}/'
+    "
+
+    run_logged "pi-unpack-runtime" ssh -p "${PI_SSH_PORT}" "${PI_SSH}" "
+      set -e
+      cd '${PI_TMPDIR}'
+      tar -xzf pi-rt.tgz
+      test -x './pi-rt/lib/ld-musl-aarch64.so.1'
+      ./pi-rt/lib/ld-musl-aarch64.so.1 --help >/dev/null 2>&1 || true
+      echo 'runtime-staged: OK'
+    "
+
+    run_logged "pi-run-suite" ssh -p "${PI_SSH_PORT}" "${PI_SSH}" "
+      set -e
+      cd '${PI_TMPDIR}'
+      LOADER='./pi-rt/lib/ld-musl-aarch64.so.1'
+      LIBPATH='./pi-rt/usr/lib:./pi-rt/lib:${PI_TMPDIR}'
+      run() { \"\$LOADER\" --library-path \"\$LIBPATH\" \"\$@\"; }
+
+      run './hello_c'
+      run './hello_cpp'
+      run './pthread'
+      run './except'
+      run './atomics'
+      run './lto_test'
+
+      run './dlopen'
+      run './dso_catch'
+      if [[ '${STRESS_DLOPEN_THREADS}' == '1' ]]; then
+        run './dlopen_threads' '${STRESS_DLOPEN_THREADS_N}' '${STRESS_DLOPEN_ITERS}' './libthrow.so'
+      fi
+      if [[ '${STRESS_RTLD_COLLISION}' == '1' ]]; then
+        run './rtld_collision'
+      fi
+
+      if [[ -x './abi_string' ]]; then
+        run './abi_string'
+      fi
+    "
+  else
+    run_logged "pi-run-suite" ssh -p "${PI_SSH_PORT}" "${PI_SSH}" "
+      set -e
+      cd '${PI_TMPDIR}'
+      './hello_c'
+      './hello_cpp'
+      './pthread'
+      './except'
+      './atomics'
+      './lto_test'
+      if [[ -x './abi_string' ]]; then
+        './abi_string'
+      fi
+    "
+  fi
+
+  if [[ "${INTEGRATION}" == "1" ]]; then
+    run_integration_suite
+  fi
+
+  mark_tier_pass "nightly"
+  tier_summary
+}
+
+tier_all() {
+  tier_report
+  tier_sanity
+  tier_smoke
+  tier_nightly
+}
+
+usage() {
+  cat <<EOF
+test-gcc14-cross-toolchain-musl.sh (version ${SCRIPT_VERSION})
+
+Usage:
+  $0 report
+  $0 sanity
+  $0 smoke
+  $0 nightly
+  $0 all
+
+LINK_MODE:
+  LINK_MODE=auto     (default) detect based on SYSROOT (static-first)
+  LINK_MODE=dynamic  run dynamic suite (dlopen/DSO/rtld)
+  LINK_MODE=static   run static suite (skip dlopen/DSO/rtld; build -static)
+                     + HARD ASSERTS:
+                       - no PT_INTERP / no interpreter
+                       - no DT_NEEDED
+
+A+ run (dynamic only):
+  A_PLUS=1 LINK_MODE=dynamic $0 all
+
+Key env:
+  TARGET=${TARGET}
+  TC_PREFIX=${TC_PREFIX}
+  SYSROOT=${SYSROOT}
+  QEMU_AARCH64=${QEMU_AARCH64}
+
+Pi env:
+  PI_SSH=${PI_SSH}
+  PI_SSH_PORT=${PI_SSH_PORT}
+  PI_TMPDIR=${PI_TMPDIR}
+
+TLS env:
+  PI_NET_TEST=${PI_NET_TEST}
+  PI_NET_TEST_URL=${PI_NET_TEST_URL}
+  PI_TLS_SELFCONTAINED=${PI_TLS_SELFCONTAINED}
+  CA_BUNDLE_URL=${CA_BUNDLE_URL}
+  PI_SYSROOT=${PI_SYSROOT}
+  TLS_CA_BUNDLE=/path/to/ca.crt (override CA selection)
+
+A+ stress env:
+  STRESS_CPP=${STRESS_CPP}
+  STRESS_LTO_MATRIX=${STRESS_LTO_MATRIX}
+  STRESS_STRIP_VERIFY=${STRESS_STRIP_VERIFY}
+  STRESS_LIBSTDCPP_ABI=${STRESS_LIBSTDCPP_ABI}
+
+EOF
+}
+
+main() {
+  echo "Version: ${SCRIPT_VERSION}"
+  need_paths
+
+  local cmd="${1:-}"
+  case "${cmd}" in
+    report)  tier_report ;;
+    sanity)  tier_sanity ;;
+    smoke)   tier_smoke ;;
+    nightly) tier_nightly ;;
+    all)     tier_all ;;
+    ""|help|-h|--help) usage ;;
+    *) die "unknown command: ${cmd}" ;;
+  esac
+}
+
+main "$@"
