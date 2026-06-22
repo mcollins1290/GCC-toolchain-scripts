@@ -2,8 +2,8 @@
 *
 
 # But track these two scripts
-!build-gcc14-musl-cross.sh
-!test-gcc14-cross-toolchain-musl.sh
+!build-musl-cross-toolchain.sh
+!test-musl-cross-toolchain.sh
 
 # (Optional) also track the .gitignore itself
 !.gitignore

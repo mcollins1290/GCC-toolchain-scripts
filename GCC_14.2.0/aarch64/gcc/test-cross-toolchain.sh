@@ -2,31 +2,32 @@
 set -Eeuo pipefail
 
 # ==============================================================================
-# test-gcc14-cross-toolchain.sh
+# test-cross-toolchain.sh
 #
 # Run the following tests and if all are clean then toolchain is good:
 #
-# ./test-gcc14-cross-toolchain.sh sanity
-# ./test-gcc14-cross-toolchain.sh smoke
-# A_PLUS=1 ./test-gcc14-cross-toolchain.sh nightly
+# ./test-cross-toolchain.sh sanity
+# ./test-cross-toolchain.sh smoke
+# A_PLUS=1 ./test-cross-toolchain.sh nightly
 # ==============================================================================
 
-SCRIPT_VERSION="v0.0.19"
+SCRIPT_VERSION="v0.1.0"
 
 # ------------------------------ Defaults --------------------------------------
 TARGET="${TARGET:-aarch64-linux-gnu}"
-TC_PREFIX="${TC_PREFIX:-/opt/gcc-14.2.0-cross}"
+GCC_VER="${GCC_VER:-15.3.0}"
+TC_PREFIX="${TC_PREFIX:-/opt/gcc-${GCC_VER}-cross}"
 SYSROOT="${SYSROOT:-/build-rpi/rpi/sysroot}"
 
 QEMU_AARCH64="${QEMU_AARCH64:-qemu-aarch64}"
 
 PI_SSH="${PI_SSH:-root@raspberrypi2.totten}"
 PI_SSH_PORT="${PI_SSH_PORT:-22}"
-PI_TMPDIR="${PI_TMPDIR:-/tmp/gcc14-toolchain-tests}"
+PI_TMPDIR="${PI_TMPDIR:-/tmp/gcc-toolchain-tests}"
 
 INTEGRATION="${INTEGRATION:-0}"
 INTEGRATION_RUN_ON_PI="${INTEGRATION_RUN_ON_PI:-0}"
-PI_INTEGRATION_DIR="${PI_INTEGRATION_DIR:-/tmp/gcc14-toolchain-integration}"
+PI_INTEGRATION_DIR="${PI_INTEGRATION_DIR:-/tmp/gcc-toolchain-integration}"
 
 PI_NET_TEST="${PI_NET_TEST:-1}"
 PI_NET_TEST_URL="${PI_NET_TEST_URL:-https://example.com}"
@@ -48,10 +49,10 @@ STRESS_OPENSSL_TLS="${STRESS_OPENSSL_TLS:-1}"
 ZLIB_VER="${ZLIB_VER:-1.3.2}"
 ZLIB_URL="${ZLIB_URL:-https://zlib.net/zlib-${ZLIB_VER}.tar.gz}"
 
-OPENSSL_VER="${OPENSSL_VER:-3.3.2}"
+OPENSSL_VER="${OPENSSL_VER:-3.5.7}"
 OPENSSL_URL="${OPENSSL_URL:-https://www.openssl.org/source/openssl-${OPENSSL_VER}.tar.gz}"
 
-CURL_VER="${CURL_VER:-8.11.1}"
+CURL_VER="${CURL_VER:-8.20.0}"
 CURL_URL="${CURL_URL:-https://curl.se/download/curl-${CURL_VER}.tar.gz}"
 
 # Integration toggles
@@ -183,7 +184,11 @@ need_qemu() {
   have_cmd "${QEMU_AARCH64}" || die "missing ${QEMU_AARCH64}. Install qemu-user (Debian: apt install qemu-user)"
 }
 
-tc() { "${TC_PREFIX}/bin/${TARGET}-$@"; }
+tc() {
+  local tool="$1"
+  shift
+  "${TC_PREFIX}/bin/${TARGET}-${tool}" "$@"
+}
 qemu_run() { "${QEMU_AARCH64}" -L "${SYSROOT}" "$@"; }
 
 download() {
@@ -211,7 +216,7 @@ extract() {
   rm -rf "$dest"
   local tmp
   tmp="$(mktemp -d)"
-  tar -xf "$tarball" -C "$tmp"
+  tar --no-same-owner -xf "$tarball" -C "$tmp"
   local top
   top="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n1 || true)"
   [[ -n "$top" ]] || die "extract failed: no top-level dir in $tarball"
@@ -1123,7 +1128,7 @@ tier_nightly() {
 
 usage() {
   cat <<EOF
-test-gcc14-cross-toolchain.sh (version ${SCRIPT_VERSION})
+test-cross-toolchain.sh (version ${SCRIPT_VERSION})
 
 Usage:
   $0 report

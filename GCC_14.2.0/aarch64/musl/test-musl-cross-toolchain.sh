@@ -2,27 +2,28 @@
 set -Eeuo pipefail
 
 # ==============================================================================
-# test-gcc14-cross-toolchain-musl.sh
+# test-musl-cross-toolchain.sh
 # Run the following 4 tests and if all pass then toolchain is solid:
 #
 # 1)
-# SYSROOT_LINK_AUDIT=1 A_PLUS=1 LINK_MODE=dynamic ./test-gcc14-cross-toolchain-musl.sh all
+# SYSROOT_LINK_AUDIT=1 A_PLUS=1 LINK_MODE=dynamic ./test-musl-cross-toolchain.sh all
 #
 # 2)
-# LINK_MODE=static SYSROOT_LINK_AUDIT=1 STRESS_CPP=1 STRESS_LTO_MATRIX=1 ./test-gcc14-cross-toolchain-musl.sh all
+# LINK_MODE=static SYSROOT_LINK_AUDIT=1 STRESS_CPP=1 STRESS_LTO_MATRIX=1 ./test-musl-cross-toolchain.sh all
 #
 # 3)
-# LINK_MODE=dynamic SYSROOT_LINK_AUDIT=1 STRESS_CPP=1 STRESS_LTO_MATRIX=1 STRESS_DLOPEN_THREADS=1 STRESS_RTLD_COLLISION=1 ./test-gcc14-cross-toolchain-musl.sh smoke
+# LINK_MODE=dynamic SYSROOT_LINK_AUDIT=1 STRESS_CPP=1 STRESS_LTO_MATRIX=1 STRESS_DLOPEN_THREADS=1 STRESS_RTLD_COLLISION=1 ./test-musl-cross-toolchain.sh smoke
 #
 # 4)
-# LINK_MODE=dynamic INTEGRATION=1 PI_TLS_SELFCONTAINED=1 PI_NET_TEST=1 ./test-gcc14-cross-toolchain-musl.sh nightly
+# LINK_MODE=dynamic INTEGRATION=1 PI_TLS_SELFCONTAINED=1 PI_NET_TEST=1 ./test-musl-cross-toolchain.sh nightly
 #
 # ==============================================================================
-SCRIPT_VERSION="v0.0.34"
+SCRIPT_VERSION="v0.1.0"
 
 # ------------------------------ Defaults --------------------------------------
 TARGET="${TARGET:-aarch64-linux-musl}"
-TC_PREFIX="${TC_PREFIX:-/opt/gcc-14.2.0-musl-cross}"
+GCC_VER="${GCC_VER:-15.3.0}"
+TC_PREFIX="${TC_PREFIX:-/opt/gcc-${GCC_VER}-musl-cross}"
 SYSROOT="${SYSROOT:-${TC_PREFIX}/${TARGET}/sysroot}"
 
 # LINK_MODE:
@@ -35,14 +36,14 @@ QEMU_AARCH64="${QEMU_AARCH64:-qemu-aarch64}"
 
 PI_SSH="${PI_SSH:-root@raspberrypi2.totten}"
 PI_SSH_PORT="${PI_SSH_PORT:-22}"
-PI_TMPDIR="${PI_TMPDIR:-/tmp/gcc14-toolchain-tests}"
+PI_TMPDIR="${PI_TMPDIR:-/tmp/gcc-toolchain-tests}"
 
 # Optional: Pi sysroot on host (for CA bundle, etc.)
 PI_SYSROOT="${PI_SYSROOT:-/build-rpi/rpi/sysroot}"
 
 INTEGRATION="${INTEGRATION:-0}"
 INTEGRATION_RUN_ON_PI="${INTEGRATION_RUN_ON_PI:-0}"
-PI_INTEGRATION_DIR="${PI_INTEGRATION_DIR:-/tmp/gcc14-toolchain-integration}"
+PI_INTEGRATION_DIR="${PI_INTEGRATION_DIR:-/tmp/gcc-toolchain-integration}"
 
 PI_NET_TEST="${PI_NET_TEST:-1}"
 PI_NET_TEST_URL="${PI_NET_TEST_URL:-https://example.com}"
@@ -65,12 +66,12 @@ STRESS_LTO_MATRIX="${STRESS_LTO_MATRIX:-0}"         # build LTO a few ways
 STRESS_STRIP_VERIFY="${STRESS_STRIP_VERIFY:-1}"     # ensure strip doesn't break runtime (dynamic only)
 STRESS_LIBSTDCPP_ABI="${STRESS_LIBSTDCPP_ABI:-1}"   # small C++ ABI sanity (dynamic+static ok)
 
-ZLIB_VER="${ZLIB_VER:-1.3.1}"
+ZLIB_VER="${ZLIB_VER:-1.3.2}"
 
-OPENSSL_VER="${OPENSSL_VER:-3.3.2}"
+OPENSSL_VER="${OPENSSL_VER:-3.5.7}"
 OPENSSL_URL="${OPENSSL_URL:-https://www.openssl.org/source/openssl-${OPENSSL_VER}.tar.gz}"
 
-CURL_VER="${CURL_VER:-8.11.1}"
+CURL_VER="${CURL_VER:-8.20.0}"
 CURL_URL="${CURL_URL:-https://curl.se/download/curl-${CURL_VER}.tar.gz}"
 
 CURL_DISABLE_LIBPSL="${CURL_DISABLE_LIBPSL:-1}"
@@ -197,7 +198,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-tc() { "${TC_PREFIX}/bin/${TARGET}-$@"; }
+tc() {
+  local tool="$1"
+  shift
+  "${TC_PREFIX}/bin/${TARGET}-${tool}" "$@"
+}
 
 detect_link_mode() {
   case "${LINK_MODE}" in
@@ -305,7 +310,7 @@ extract() {
   rm -rf "$dest"
   local tmp
   tmp="$(mktemp -d)"
-  tar -xf "$tarball" -C "$tmp"
+  tar --no-same-owner -xf "$tarball" -C "$tmp"
   local top
   top="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n1 || true)"
   [[ -n "$top" ]] || die "extract failed: no top-level dir in $tarball"
@@ -1539,7 +1544,7 @@ tier_all() {
 
 usage() {
   cat <<EOF
-test-gcc14-cross-toolchain-musl.sh (version ${SCRIPT_VERSION})
+test-musl-cross-toolchain.sh (version ${SCRIPT_VERSION})
 
 Usage:
   $0 report

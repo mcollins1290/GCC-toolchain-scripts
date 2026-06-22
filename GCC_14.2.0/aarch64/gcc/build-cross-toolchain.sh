@@ -10,11 +10,12 @@ set -Eeuo pipefail
 ###############################################################################
 # Script Metadata
 ###############################################################################
-SCRIPT_VERSION="v0.0.4"
+SCRIPT_VERSION="v0.1.0"
 
 # ------------------------------ User config -----------------------------------
 TARGET="${TARGET:-aarch64-linux-gnu}"
-PREFIX="${PREFIX:-/opt/gcc-14.2.0-cross}"
+GCC_VER="${GCC_VER:-15.3.0}"
+PREFIX="${PREFIX:-/opt/gcc-${GCC_VER}-cross}"
 SYSROOT="${SYSROOT:-/build-rpi/rpi/sysroot}"
 
 # These are *defaults for GCC*, not required build flags for your projects.
@@ -47,17 +48,16 @@ PREFIX_CLEANED=0
 
 # ------------------------------ Versions / URLs -------------------------------
 # GCC
-GCC_VER="${GCC_VER:-14.2.0}"
 GCC_TARBALL="${GCC_TARBALL:-gcc-${GCC_VER}.tar.xz}"
 GCC_URL="${GCC_URL:-https://ftp.gnu.org/gnu/gcc/gcc-${GCC_VER}/${GCC_TARBALL}}"
-GCC_SHA256="${GCC_SHA256:-a7b39bc69cbf9e25826c5a60ab26477001f7c08d85cec04bc0e29cabed6f3cc9}"
+GCC_SHA256="${GCC_SHA256:-fa59c1beef8995f27c4d71c1df227587189315d3e6faff1bb4306e61b0c530eb}"
 GCC_SRC_DIR="${GCC_SRC_DIR:-${SRC_ROOT}/gcc-${GCC_VER}}"
 
 # Binutils
-BINUTILS_VER="${BINUTILS_VER:-2.44}"
+BINUTILS_VER="${BINUTILS_VER:-2.46.1}"
 BINUTILS_TARBALL="${BINUTILS_TARBALL:-binutils-${BINUTILS_VER}.tar.xz}"
 BINUTILS_URL="${BINUTILS_URL:-https://ftp.gnu.org/gnu/binutils/${BINUTILS_TARBALL}}"
-BINUTILS_SHA256="${BINUTILS_SHA256:-ce2017e059d63e67ddb9240e9d4ec49c2893605035cd60e92ad53177f4377237}"
+BINUTILS_SHA256="${BINUTILS_SHA256:-e127a709cba24c76de8936cb7083dd768f28cd37eb010492e2f19b71eb1294e4}"
 BINUTILS_SRC_DIR="${BINUTILS_SRC_DIR:-${SRC_ROOT}/binutils-${BINUTILS_VER}}"
 BINUTILS_BUILD_DIR="${BINUTILS_BUILD_DIR:-${BUILD_DIR}/binutils}"
 
@@ -114,10 +114,7 @@ verify_sha256() {
   local expect="${2:-}"
 
   [[ -f "$file" ]] || die "verify_sha256: missing file: $file"
-  if [[ -z "$expect" ]]; then
-    echo "WARNING: no SHA256 provided for $(basename "$file") — skipping verification." >&2
-    return 0
-  fi
+  [[ -n "$expect" ]] || die "no SHA256 provided for $(basename "$file"); refusing unverified source"
   have_cmd sha256sum || die "sha256sum not found"
 
   local got
@@ -143,7 +140,7 @@ extract_tarball() {
 
   local tmp
   tmp="$(mktemp -d)"
-  tar -xf "$tarball" -C "$tmp"
+  tar --no-same-owner -xf "$tarball" -C "$tmp"
   local top
   top="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n1 || true)"
   [[ -n "$top" ]] || die "extract failed: no top-level dir in $tarball"
@@ -167,7 +164,7 @@ ensure_gcc_source() {
   # Ensure GCC prerequisites are present (gmp/mpfr/mpc/isl)
   if [[ ! -f "${GCC_SRC_DIR}/gmp/README" ]]; then
     echo "==> gcc: fetching prerequisites (gmp/mpfr/mpc/isl)"
-    ( cd "${GCC_SRC_DIR}" && ./contrib/download_prerequisites )
+    ( cd "${GCC_SRC_DIR}" && TAR_OPTIONS="${TAR_OPTIONS:+${TAR_OPTIONS} }--no-same-owner" ./contrib/download_prerequisites )
   fi
 }
 
@@ -180,6 +177,20 @@ ensure_binutils_source() {
   download_file "${BINUTILS_URL}" "${tb}"
   verify_sha256 "${tb}" "${BINUTILS_SHA256}"
   extract_tarball "${tb}" "${BINUTILS_SRC_DIR}"
+}
+
+print_source_hashes() {
+  have_cmd sha256sum || die "sha256sum not found"
+  mkdirp "${TARBALL_DIR}"
+
+  local gcc_tb="${TARBALL_DIR}/${GCC_TARBALL}"
+  local binutils_tb="${TARBALL_DIR}/${BINUTILS_TARBALL}"
+  download_file "${GCC_URL}" "${gcc_tb}"
+  download_file "${BINUTILS_URL}" "${binutils_tb}"
+
+  echo
+  echo "Candidate hashes; verify these against upstream signatures before pinning:"
+  sha256sum "${gcc_tb}" "${binutils_tb}"
 }
 
 # ------------------------------ Env ------------------------------------------
@@ -203,11 +214,16 @@ require_sysroot() {
   [[ -d "${SYSROOT}" ]] || die "SYSROOT not found: ${SYSROOT}"
   [[ -d "${SYSROOT}/usr/include" ]] || die "SYSROOT missing usr/include: ${SYSROOT}"
 
-  # Debian multiarch sysroots: these typically live under /usr/lib/aarch64-linux-gnu
-  find "${SYSROOT}" -type f \( -name crt1.o -o -name crti.o -o -name crtn.o \) >/dev/null \
-    || die "SYSROOT missing crt*.o start files (crt1.o/crti.o/crtn.o)"
+  # Debian multiarch sysroots: these typically live under /usr/lib/aarch64-linux-gnu.
+  # Search with stderr suppressed so unrelated unreadable directories inside a
+  # copied sysroot do not mask valid startup files.
+  local crt
+  for crt in crt1.o crti.o crtn.o; do
+    [[ -n "$(find "${SYSROOT}" -type f -name "${crt}" -print -quit 2>/dev/null)" ]] \
+      || die "SYSROOT missing ${crt} start file"
+  done
 
-  find "${SYSROOT}" -type f -name 'ld-linux-aarch64.so.1' >/dev/null \
+  [[ -n "$(find "${SYSROOT}" -type f -name 'ld-linux-aarch64.so.1' -print -quit 2>/dev/null)" ]] \
     || die "SYSROOT missing dynamic linker ld-linux-aarch64.so.1"
 
   [[ -f "${SYSROOT}/usr/lib/aarch64-linux-gnu/libc.so" ]] || \
@@ -242,7 +258,6 @@ build_binutils() {
       --disable-nls \
       --enable-plugins \
       --enable-lto \
-      --enable-gold \
       --enable-ld=default \
       --with-system-zlib
   "
@@ -347,6 +362,7 @@ usage() {
 Usage: $0 <command>
 
 Commands:
+  fetch-hashes Download source archives and print candidate SHA256 values
   binutils   Download/extract (if needed) + build+install cross binutils into PREFIX
   gcc        Download/extract (if needed) + build+install final GCC (C,C++) into PREFIX
   build      Build binutils then GCC
@@ -369,6 +385,7 @@ main() {
   echo "Version: $SCRIPT_VERSION"
   local cmd="${1:-}"
   case "${cmd}" in
+    fetch-hashes) print_source_hashes ;;
     binutils) build_binutils ;;
     gcc)      build_toolchain ;;
     build)    build_all ;;

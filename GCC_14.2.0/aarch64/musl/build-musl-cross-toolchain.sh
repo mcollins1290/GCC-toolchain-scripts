@@ -11,11 +11,12 @@ set -Eeuo pipefail
 ###############################################################################
 # Script Metadata
 ###############################################################################
-SCRIPT_VERSION="v0.0.3-musl"
+SCRIPT_VERSION="v0.1.0-musl"
 
 # ------------------------------ User config -----------------------------------
 TARGET="${TARGET:-aarch64-linux-musl}"
-PREFIX="${PREFIX:-/opt/gcc-14.2.0-musl-cross}"
+GCC_VER="${GCC_VER:-15.3.0}"
+PREFIX="${PREFIX:-/opt/gcc-${GCC_VER}-musl-cross}"
 
 # For musl toolchains, a self-contained sysroot is typical.
 SYSROOT="${SYSROOT:-${PREFIX}/${TARGET}/sysroot}"
@@ -52,35 +53,41 @@ PREFIX_CLEANED=0
 
 # ------------------------------ Versions / URLs -------------------------------
 # GCC
-GCC_VER="${GCC_VER:-14.2.0}"
 GCC_TARBALL="${GCC_TARBALL:-gcc-${GCC_VER}.tar.xz}"
 GCC_URL="${GCC_URL:-https://ftp.gnu.org/gnu/gcc/gcc-${GCC_VER}/${GCC_TARBALL}}"
-GCC_SHA256="${GCC_SHA256:-a7b39bc69cbf9e25826c5a60ab26477001f7c08d85cec04bc0e29cabed6f3cc9}"
+GCC_SHA256="${GCC_SHA256:-fa59c1beef8995f27c4d71c1df227587189315d3e6faff1bb4306e61b0c530eb}"
 GCC_SRC_DIR="${GCC_SRC_DIR:-${SRC_ROOT}/gcc-${GCC_VER}}"
 
 # Binutils
-BINUTILS_VER="${BINUTILS_VER:-2.44}"
+BINUTILS_VER="${BINUTILS_VER:-2.46.1}"
 BINUTILS_TARBALL="${BINUTILS_TARBALL:-binutils-${BINUTILS_VER}.tar.xz}"
 BINUTILS_URL="${BINUTILS_URL:-https://ftp.gnu.org/gnu/binutils/${BINUTILS_TARBALL}}"
-BINUTILS_SHA256="${BINUTILS_SHA256:-ce2017e059d63e67ddb9240e9d4ec49c2893605035cd60e92ad53177f4377237}"
+BINUTILS_SHA256="${BINUTILS_SHA256:-e127a709cba24c76de8936cb7083dd768f28cd37eb010492e2f19b71eb1294e4}"
 BINUTILS_SRC_DIR="${BINUTILS_SRC_DIR:-${SRC_ROOT}/binutils-${BINUTILS_VER}}"
 BINUTILS_BUILD_DIR="${BINUTILS_BUILD_DIR:-${BUILD_DIR}/binutils}"
 
 # Linux kernel headers (needed for libc)
-LINUX_VER="${LINUX_VER:-6.12.20}"
+LINUX_VER="${LINUX_VER:-6.18.36}"
 LINUX_TARBALL="${LINUX_TARBALL:-linux-${LINUX_VER}.tar.xz}"
 LINUX_URL="${LINUX_URL:-https://cdn.kernel.org/pub/linux/kernel/v6.x/${LINUX_TARBALL}}"
-LINUX_SHA256="${LINUX_SHA256:-}"  # optional
+LINUX_SHA256="${LINUX_SHA256:-fbab86c9f471c81075b280cca30bd85d790c060063a1245859b6344b07c9c44e}"
 LINUX_SRC_DIR="${LINUX_SRC_DIR:-${SRC_ROOT}/linux-${LINUX_VER}}"
 LINUX_BUILD_DIR="${LINUX_BUILD_DIR:-${BUILD_DIR}/linux-headers}"
 
 # musl
-MUSL_VER="${MUSL_VER:-1.2.5}"
+MUSL_VER="${MUSL_VER:-1.2.6}"
 MUSL_TARBALL="${MUSL_TARBALL:-musl-${MUSL_VER}.tar.gz}"
 MUSL_URL="${MUSL_URL:-https://musl.libc.org/releases/${MUSL_TARBALL}}"
-MUSL_SHA256="${MUSL_SHA256:-}"  # optional (set it if you want hard pinning)
+MUSL_SHA256="${MUSL_SHA256:-d585fd3b613c66151fc3249e8ed44f77020cb5e6c1e635a616d3f9f82460512a}"
 MUSL_SRC_DIR="${MUSL_SRC_DIR:-${SRC_ROOT}/musl-${MUSL_VER}}"
 MUSL_BUILD_DIR="${MUSL_BUILD_DIR:-${BUILD_DIR}/musl}"
+
+# Upstream fix for CVE-2026-6042. The qsort fix for CVE-2026-40200 is
+# 32-bit-only and does not affect this aarch64 toolchain.
+MUSL_ICONV_PATCH_COMMIT="${MUSL_ICONV_PATCH_COMMIT:-67219f0130ec7c876ac0b299046460fad31caabf}"
+MUSL_ICONV_PATCH_URL="${MUSL_ICONV_PATCH_URL:-https://git.musl-libc.org/cgit/musl/patch/?id=${MUSL_ICONV_PATCH_COMMIT}}"
+MUSL_ICONV_PATCH_FILE="${MUSL_ICONV_PATCH_FILE:-${TARBALL_DIR}/musl-${MUSL_ICONV_PATCH_COMMIT}.patch}"
+MUSL_ICONV_PATCH_SHA256="${MUSL_ICONV_PATCH_SHA256:-1d0be2e72b9d5bd16546b923aa8af861d271322f01644716a81823bec4065c99}"
 
 # ------------------------------ Helpers ---------------------------------------
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
@@ -135,10 +142,7 @@ verify_sha256() {
   local expect="${2:-}"
 
   [[ -f "$file" ]] || die "verify_sha256: missing file: $file"
-  if [[ -z "$expect" ]]; then
-    echo "WARNING: no SHA256 provided for $(basename "$file") — skipping verification." >&2
-    return 0
-  fi
+  [[ -n "$expect" ]] || die "no SHA256 provided for $(basename "$file"); refusing unverified source"
   have_cmd sha256sum || die "sha256sum not found"
 
   local got
@@ -164,7 +168,7 @@ extract_tarball() {
 
   local tmp
   tmp="$(mktemp -d)"
-  tar -xf "$tarball" -C "$tmp"
+  tar --no-same-owner -xf "$tarball" -C "$tmp"
   local top
   top="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n1 || true)"
   [[ -n "$top" ]] || die "extract failed: no top-level dir in $tarball"
@@ -187,7 +191,7 @@ ensure_gcc_source() {
 
   if [[ ! -f "${GCC_SRC_DIR}/gmp/README" ]]; then
     echo "==> gcc: fetching prerequisites (gmp/mpfr/mpc/isl)"
-    ( cd "${GCC_SRC_DIR}" && ./contrib/download_prerequisites )
+    ( cd "${GCC_SRC_DIR}" && TAR_OPTIONS="${TAR_OPTIONS:+${TAR_OPTIONS} }--no-same-owner" ./contrib/download_prerequisites )
   fi
 }
 
@@ -213,19 +217,56 @@ ensure_linux_source() {
   echo "==> extract: $tb -> ${LINUX_SRC_DIR}"
   rm -rf "${LINUX_SRC_DIR}"
   mkdirp "$(dirname "${LINUX_SRC_DIR}")"
-  tar -xf "$tb" -C "$(dirname "${LINUX_SRC_DIR}")"
+  tar --no-same-owner -xf "$tb" -C "$(dirname "${LINUX_SRC_DIR}")"
   [[ -f "${LINUX_SRC_DIR}/Makefile" ]] || die "linux extract missing Makefile: ${LINUX_SRC_DIR}"
 }
 
 ensure_musl_source() {
   mkdirp "${SRC_ROOT}" "${TARBALL_DIR}"
   if [[ -d "${MUSL_SRC_DIR}" && -f "${MUSL_SRC_DIR}/configure" ]]; then
-    return 0
+    :
+  else
+    local tb="${TARBALL_DIR}/${MUSL_TARBALL}"
+    download_file "${MUSL_URL}" "${tb}"
+    verify_sha256 "${tb}" "${MUSL_SHA256}"
+    extract_tarball "${tb}" "${MUSL_SRC_DIR}"
   fi
-  local tb="${TARBALL_DIR}/${MUSL_TARBALL}"
-  download_file "${MUSL_URL}" "${tb}"
-  verify_sha256 "${tb}" "${MUSL_SHA256}"
-  extract_tarball "${tb}" "${MUSL_SRC_DIR}"
+
+  local marker="${MUSL_SRC_DIR}/.patched-${MUSL_ICONV_PATCH_COMMIT}"
+  if [[ ! -f "${marker}" ]]; then
+    have_cmd patch || die "missing patch utility"
+    download_file "${MUSL_ICONV_PATCH_URL}" "${MUSL_ICONV_PATCH_FILE}"
+    verify_sha256 "${MUSL_ICONV_PATCH_FILE}" "${MUSL_ICONV_PATCH_SHA256}"
+    grep -q "From ${MUSL_ICONV_PATCH_COMMIT} " "${MUSL_ICONV_PATCH_FILE}" \
+      || die "musl patch does not identify expected commit ${MUSL_ICONV_PATCH_COMMIT}"
+    echo "==> musl: applying CVE-2026-6042 fix ${MUSL_ICONV_PATCH_COMMIT}"
+    ( cd "${MUSL_SRC_DIR}" && patch -p1 < "${MUSL_ICONV_PATCH_FILE}" )
+    touch "${marker}"
+  fi
+}
+
+print_source_hashes() {
+  have_cmd sha256sum || die "sha256sum not found"
+  mkdirp "${TARBALL_DIR}"
+
+  local gcc_tb="${TARBALL_DIR}/${GCC_TARBALL}"
+  local binutils_tb="${TARBALL_DIR}/${BINUTILS_TARBALL}"
+  local linux_tb="${TARBALL_DIR}/${LINUX_TARBALL}"
+  local musl_tb="${TARBALL_DIR}/${MUSL_TARBALL}"
+  download_file "${GCC_URL}" "${gcc_tb}"
+  download_file "${BINUTILS_URL}" "${binutils_tb}"
+  download_file "${LINUX_URL}" "${linux_tb}"
+  download_file "${MUSL_URL}" "${musl_tb}"
+  download_file "${MUSL_ICONV_PATCH_URL}" "${MUSL_ICONV_PATCH_FILE}"
+
+  echo
+  echo "Candidate hashes; verify these against upstream signatures before pinning:"
+  sha256sum \
+    "${gcc_tb}" \
+    "${binutils_tb}" \
+    "${linux_tb}" \
+    "${musl_tb}" \
+    "${MUSL_ICONV_PATCH_FILE}"
 }
 
 # ------------------------------ Env ------------------------------------------
@@ -294,7 +335,6 @@ build_binutils() {
       --disable-nls \
       --enable-plugins \
       --enable-lto \
-      --enable-gold \
       --enable-ld=default \
       --with-system-zlib
   "
@@ -476,7 +516,8 @@ install_runtime_libs_to_sysroot() {
     local p
     for p in "${patterns[@]}"; do
       shopt -s nullglob
-      local matches=( ${d}/${p} )
+      local matches=()
+      mapfile -t matches < <(compgen -G "${d}/${p}" || true)
       shopt -u nullglob
 
       if (( ${#matches[@]} > 0 )); then
@@ -593,6 +634,7 @@ usage() {
 Usage: $0 <command>
 
 Commands:
+  fetch-hashes Download source archives and print candidate SHA256 values
   binutils   Download/extract (if needed) + build+install cross binutils into PREFIX
   headers    Download/extract (if needed) + install linux headers into SYSROOT
   stage1     Build+install GCC stage1 (C + libgcc) into PREFIX (no libc)
@@ -625,6 +667,7 @@ main() {
   echo "Version: $SCRIPT_VERSION"
   local cmd="${1:-}"
   case "${cmd}" in
+    fetch-hashes) print_source_hashes ;;
     binutils) build_binutils ;;
     headers)  install_linux_headers ;;
     stage1)   build_gcc_stage1 ;;
