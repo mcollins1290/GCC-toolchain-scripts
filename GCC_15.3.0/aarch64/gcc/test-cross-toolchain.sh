@@ -82,6 +82,7 @@ INSTALL_DIR="${INSTALL_DIR:-${CACHE_DIR}/install/${TARGET}}"
 
 KEEP_WORKDIR="${KEEP_WORKDIR:-0}"
 KEEP_CACHE="${KEEP_CACHE:-1}"
+FRESH_LOGS="${FRESH_LOGS:-1}"
 
 # ------------------------------ A+ Super Suite Switch --------------------------
 # When A_PLUS=1, automatically enable all heavy integration + stress tests.
@@ -224,6 +225,14 @@ mkdirp() { mkdir -p "$@"; }
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
+
+reset_logs_for_run() {
+  [[ "${FRESH_LOGS}" == "1" ]] || return 0
+
+  mkdirp "${LOG_DIR}"
+  rm -f "${LOG_DIR}"/*.log "${LOG_DIR}/validation-report.txt"
+  rm -rf "${LOG_DIR}/.status"
+}
 
 run_logged() {
   local name="$1"; shift
@@ -1487,6 +1496,7 @@ Key env (common):
   TC_PREFIX=${TC_PREFIX}
   SYSROOT=${SYSROOT}
   QEMU_AARCH64=${QEMU_AARCH64}
+  FRESH_LOGS=1              (default; clears prior logs/status at start of a run)
 
 Nightly (runs on Pi):
   PI_SSH=${PI_SSH}
@@ -1527,11 +1537,11 @@ main() {
   local cmd="${1:-}"
   case "${cmd}" in
     fetch-integration-hashes) print_integration_hashes ;;
-    report)  tier_report ;;
-    sanity)  tier_sanity ;;
-    smoke)   tier_smoke ;;
-    nightly) tier_nightly ;;
-    all)     tier_all ;;
+    report)  reset_logs_for_run; tier_report ;;
+    sanity)  reset_logs_for_run; tier_sanity ;;
+    smoke)   reset_logs_for_run; tier_smoke ;;
+    nightly) reset_logs_for_run; tier_nightly ;;
+    all)     reset_logs_for_run; tier_all ;;
     ""|help|-h|--help) usage ;;
     *) die "unknown command: ${cmd}" ;;
   esac
