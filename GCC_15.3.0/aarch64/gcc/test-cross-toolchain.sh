@@ -1163,11 +1163,19 @@ integration_run_on_pi() {
       echo 'expected CAfile: /etc/ssl/certs/ca-certificates.crt'
       echo 'expected CApath: /etc/ssl/certs'
 
-      out=\$(\"\\\${C}\" -vI --max-time 15 '${PI_NET_TEST_URL}' 2>&1 || true)
-      out=\$(printf '%s\n' \"\\\${out}\" | tr -d '\\r')
+      set +e
+      out=\$(\"\${C}\" -vI --max-time 15 '${PI_NET_TEST_URL}' 2>&1)
+      probe_rc=\$?
+      set -e
+      out=\$(printf '%s\n' \"\${out}\" | tr -d '\\r')
+      printf '%s\n' \"\${out}\"
+      if [[ \${probe_rc} -ne 0 ]]; then
+        echo \"trust-FAIL(default): curl verbose trust-store probe failed (exit=\${probe_rc})\"
+        exit \${probe_rc}
+      fi
 
-      cafile=\$(printf '%s\n' \"\\\${out}\" | sed -nE 's/^[*[:space:]]*CAfile:[[:space:]]*(.*)\$/\\1/p' | head -n1)
-      capath=\$(printf '%s\n' \"\\\${out}\" | sed -nE 's/^[*[:space:]]*CApath:[[:space:]]*(.*)\$/\\1/p' | head -n1)
+      cafile=\$(printf '%s\n' \"\${out}\" | sed -nE 's/^[*[:space:]]*CAfile:[[:space:]]*(.*)\$/\\1/p' | head -n1)
+      capath=\$(printf '%s\n' \"\${out}\" | sed -nE 's/^[*[:space:]]*CApath:[[:space:]]*(.*)\$/\\1/p' | head -n1)
 
       echo \"seen CAfile: \${cafile:-'(not reported)'}\"
       echo \"seen CApath: \${capath:-'(not reported)'}\"
