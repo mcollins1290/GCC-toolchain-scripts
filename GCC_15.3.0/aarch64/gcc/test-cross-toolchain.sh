@@ -988,9 +988,11 @@ integration_curl() {
   run_logged "integration-curl-install" bash -lc "set -e; cd '${src}'; make install"
 }
 
-integration_fixup_curl_rpath() {
-  local curl_bin="${INSTALL_DIR}/bin/curl"
-  [[ -x "${curl_bin}" ]] || die "curl binary not found at: ${curl_bin}"
+integration_fixup_binary_rpath() {
+  local name="$1"
+  local bin="$2"
+
+  [[ -x "${bin}" ]] || die "${name} binary not found at: ${bin}"
   have_cmd readelf || die "missing readelf"
   have_cmd grep || die "missing grep"
 
@@ -998,21 +1000,32 @@ integration_fixup_curl_rpath() {
   # shellcheck disable=SC2016
   wanted_runpath='$ORIGIN/../lib:$ORIGIN/../lib64'
 
-  run_logged "integration-fixup-curl-rpath" bash -lc "
+  run_logged "integration-fixup-${name}-rpath-before" bash -lc "
     set -e
     echo 'before:'
-    readelf -d '${curl_bin}' | grep -E 'RPATH|RUNPATH' || true
+    readelf -d '${bin}' | grep -E 'RPATH|RUNPATH' || true
   "
 
   if have_cmd patchelf; then
-    patchelf --set-rpath "${wanted_runpath}" "${curl_bin}"
+    patchelf --set-rpath "${wanted_runpath}" "${bin}"
   elif have_cmd chrpath; then
-    chrpath -r "${wanted_runpath}" "${curl_bin}"
+    chrpath -r "${wanted_runpath}" "${bin}"
   else
     echo
     echo "ERROR: need patchelf or chrpath on host to fix RPATH/RUNPATH"
     return 2
   fi
+
+  run_logged "integration-fixup-${name}-rpath-after" bash -lc "
+    set -e
+    echo 'after:'
+    readelf -d '${bin}' | grep -E 'RPATH|RUNPATH'
+  "
+}
+
+integration_fixup_runtime_rpaths() {
+  integration_fixup_binary_rpath "openssl" "${INSTALL_DIR}/bin/openssl"
+  integration_fixup_binary_rpath "curl" "${INSTALL_DIR}/bin/curl"
 }
 
 integration_run_on_pi() {
@@ -1045,6 +1058,45 @@ integration_run_on_pi() {
 
     \"\${O}\" version || true
     \"\${C}\" --version || true
+
+    echo
+    echo '== openssl RUNPATH/RPATH =='
+    if [[ -x '${PI_INTEGRATION_DIR}/bin/openssl' ]]; then
+      readelf -d '${PI_INTEGRATION_DIR}/bin/openssl' | grep -E 'RPATH|RUNPATH' || true
+    else
+      echo '(integrated openssl not present; using system openssl)'
+    fi
+
+    echo
+    echo '== openssl deps (subset) =='
+    if [[ -x '${PI_INTEGRATION_DIR}/bin/openssl' ]]; then
+      openssl_deps=\$(ldd '${PI_INTEGRATION_DIR}/bin/openssl')
+      printf '%s\n' \"\${openssl_deps}\" | grep -E 'ssl|crypto' || true
+
+      ssl_line=\$(printf '%s\n' \"\${openssl_deps}\" | grep -E 'libssl\.so\.3[[:space:]]+=>' | head -n1 || true)
+      crypto_line=\$(printf '%s\n' \"\${openssl_deps}\" | grep -E 'libcrypto\.so\.3[[:space:]]+=>' | head -n1 || true)
+      case \"\${ssl_line}\" in
+        *'${PI_INTEGRATION_DIR}'*) ;;
+        *) echo \"ERROR: staged openssl is not loading staged libssl: \${ssl_line}\"; exit 10 ;;
+      esac
+      case \"\${crypto_line}\" in
+        *'${PI_INTEGRATION_DIR}'*) ;;
+        *) echo \"ERROR: staged openssl is not loading staged libcrypto: \${crypto_line}\"; exit 10 ;;
+      esac
+
+      openssl_ver=\$(\"\${O}\" version)
+      openssl_cmd_ver=\$(printf '%s\n' \"\${openssl_ver}\" | sed -nE 's/^OpenSSL[[:space:]]+([^[:space:]]+).*/\1/p')
+      openssl_lib_ver=\$(printf '%s\n' \"\${openssl_ver}\" | sed -nE 's/.*\\(Library: OpenSSL[[:space:]]+([^[:space:]]+).*/\1/p')
+      if [[ -z \"\${openssl_lib_ver}\" ]]; then openssl_lib_ver=\"\${openssl_cmd_ver}\"; fi
+      echo \"openssl-command-version=\${openssl_cmd_ver}\"
+      echo \"openssl-library-version=\${openssl_lib_ver}\"
+      if [[ -z \"\${openssl_cmd_ver}\" || \"\${openssl_cmd_ver}\" != \"\${openssl_lib_ver}\" ]]; then
+        echo \"ERROR: staged openssl command/library version mismatch\"
+        exit 10
+      fi
+    else
+      echo '(integrated openssl not present; using system openssl)'
+    fi
 
     echo
     echo '== curl -V (CAfile/CApath visibility) =='
@@ -1192,7 +1244,7 @@ run_integration_suite() {
   integration_openssl
   integration_stage_ca_bundle
   integration_curl
-  integration_fixup_curl_rpath
+  integration_fixup_runtime_rpaths
 
   log "INTEGRATION: PASS"
 
