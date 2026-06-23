@@ -48,12 +48,21 @@ STRESS_OPENSSL_TLS="${STRESS_OPENSSL_TLS:-1}"
 
 ZLIB_VER="${ZLIB_VER:-1.3.2}"
 ZLIB_URL="${ZLIB_URL:-https://zlib.net/zlib-${ZLIB_VER}.tar.gz}"
+ZLIB_SIG_URL="${ZLIB_SIG_URL:-${ZLIB_URL}.asc}"
+ZLIB_SHA256="${ZLIB_SHA256:-bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16}"
 
 OPENSSL_VER="${OPENSSL_VER:-3.5.7}"
 OPENSSL_URL="${OPENSSL_URL:-https://www.openssl.org/source/openssl-${OPENSSL_VER}.tar.gz}"
+OPENSSL_SIG_URL="${OPENSSL_SIG_URL:-${OPENSSL_URL}.asc}"
+OPENSSL_SHA256="${OPENSSL_SHA256:-a8c0d28a529ca480f9f36cf5792e2cd21984552a3c8e4aa11a24aa31aeac98e8}"
 
 CURL_VER="${CURL_VER:-8.20.0}"
 CURL_URL="${CURL_URL:-https://curl.se/download/curl-${CURL_VER}.tar.gz}"
+CURL_SIG_URL="${CURL_SIG_URL:-${CURL_URL}.asc}"
+CURL_SHA256="${CURL_SHA256:-fc5819cad3f9f5482669adcdc49a782c15f36d2a0715b395b06d9173593d2dc0}"
+
+VERIFY_INTEGRATION_DOWNLOADS="${VERIFY_INTEGRATION_DOWNLOADS:-1}"
+VERIFY_INTEGRATION_GPG="${VERIFY_INTEGRATION_GPG:-1}"
 
 # Integration toggles
 CURL_DISABLE_LIBPSL="${CURL_DISABLE_LIBPSL:-1}"
@@ -87,8 +96,8 @@ if [[ "${A_PLUS}" == "1" ]]; then
   PI_TLS_SELFCONTAINED=1
 
   STRESS_DLOPEN_THREADS=1
-  STRESS_DLOPEN_THREADS_N="${STRESS_DLOPEN_THREADS_N:-4}"
-  STRESS_DLOPEN_ITERS="${STRESS_DLOPEN_ITERS:-500}"
+  STRESS_DLOPEN_THREADS_N="${A_PLUS_DLOPEN_THREADS_N:-4}"
+  STRESS_DLOPEN_ITERS="${A_PLUS_DLOPEN_ITERS:-500}"
 
   STRESS_RTLD_COLLISION=1
   STRESS_OPENSSL_TLS=1
@@ -103,7 +112,9 @@ on_err() {
   if [[ -n "${CURRENT_TIER}" ]]; then
     echo
     echo ">>> ${CURRENT_TIER}: FAIL (exit=${exit_code})"
-    [[ -n "${TIER_STATUS_DIR}" ]] && echo "FAIL" > "${TIER_STATUS_DIR}/${CURRENT_TIER}.status" 2>/dev/null || true
+    if [[ -n "${TIER_STATUS_DIR}" ]]; then
+      echo "FAIL" > "${TIER_STATUS_DIR}/${CURRENT_TIER}.status" 2>/dev/null || true
+    fi
   else
     echo
     echo ">>> FAIL (exit=${exit_code})"
@@ -177,7 +188,7 @@ need_paths() {
   [[ -x "${TC_PREFIX}/bin/${TARGET}-ar"  ]] || die "missing: ${TC_PREFIX}/bin/${TARGET}-ar"
   [[ -x "${TC_PREFIX}/bin/${TARGET}-ranlib"  ]] || die "missing: ${TC_PREFIX}/bin/${TARGET}-ranlib"
   [[ -d "${SYSROOT}/usr/include" ]] || die "missing sysroot headers: ${SYSROOT}/usr/include"
-  [[ -e "${SYSROOT}/lib/ld-linux-aarch64.so.1" ]] || die "missing sysroot loader: ${SYSROOT}/lib/ld-linux-aarch64.so.1"
+  sysroot_loader >/dev/null || die "missing sysroot loader ld-linux-aarch64.so.1 under ${SYSROOT}"
 }
 
 need_qemu() {
@@ -190,6 +201,49 @@ tc() {
   "${TC_PREFIX}/bin/${TARGET}-${tool}" "$@"
 }
 qemu_run() { "${QEMU_AARCH64}" -L "${SYSROOT}" "$@"; }
+
+sysroot_loader() {
+  local p
+  for p in \
+    "${SYSROOT}/lib/ld-linux-aarch64.so.1" \
+    "${SYSROOT}/usr/lib/ld-linux-aarch64.so.1" \
+    "${SYSROOT}/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1" \
+    "${SYSROOT}/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1"
+  do
+    [[ -e "${p}" ]] && { printf '%s\n' "${p}"; return 0; }
+  done
+  return 1
+}
+
+sysroot_glibc_version() {
+  local libc line
+  libc="$(find "${SYSROOT}" -type f -name 'libc.so.6' -print -quit 2>/dev/null || true)"
+  [[ -n "${libc}" ]] || return 1
+
+  line="$(strings "${libc}" 2>/dev/null | grep -E 'GNU C Library.*release version [0-9]' | head -n 1 || true)"
+  if [[ -n "${line}" ]]; then
+    printf '%s\n' "${line}" | sed -nE 's/.*release version ([0-9]+([.][0-9]+)+).*/\1/p'
+    return 0
+  fi
+
+  strings "${libc}" 2>/dev/null | sed -nE 's/.*GLIBC ([0-9]+([.][0-9]+)+).*/\1/p' | head -n 1
+}
+
+assert_sysroot_abi() {
+  have_cmd strings || die "missing strings"
+
+  local glibc
+  glibc="$(sysroot_glibc_version || true)"
+  [[ -n "${glibc}" ]] || die "could not determine sysroot glibc version from ${SYSROOT}"
+
+  run_logged "sysroot-abi" bash -lc "
+    set -e
+    echo 'sysroot=${SYSROOT}'
+    echo 'glibc_version=${glibc}'
+    find '${SYSROOT}' -type f -name 'libc.so.6' -print -quit
+    find '${SYSROOT}' -path '*ld-linux-aarch64.so.1' -print 2>/dev/null | sort
+  "
+}
 
 download() {
   local url="$1"
@@ -207,6 +261,50 @@ download() {
   else
     die "need curl or wget to download: $url"
   fi
+}
+
+verify_sha256() {
+  local file="$1"
+  local expect="$2"
+
+  [[ "${VERIFY_INTEGRATION_DOWNLOADS}" == "1" ]] || return 0
+  [[ -n "${expect}" ]] || die "missing SHA256 for $(basename "${file}"). Set the matching *_SHA256 or VERIFY_INTEGRATION_DOWNLOADS=0."
+  have_cmd sha256sum || die "sha256sum not found"
+
+  local got
+  got="$(sha256sum "${file}" | awk '{print $1}')"
+  [[ "${got}" == "${expect}" ]] || die "SHA256 mismatch for ${file}: got ${got} expected ${expect}"
+  log "sha256 ok: $(basename "${file}")"
+}
+
+verify_gpg_signature() {
+  local file="$1"
+  local sig_url="$2"
+  local sig="${file}.asc"
+
+  [[ "${VERIFY_INTEGRATION_GPG}" == "1" ]] || return 0
+  have_cmd gpg || die "VERIFY_INTEGRATION_GPG=1 requires gpg"
+
+  download "${sig_url}" "${sig}"
+  gpg --verify "${sig}" "${file}"
+  log "gpg signature ok: $(basename "${file}")"
+}
+
+print_integration_hashes() {
+  have_cmd sha256sum || die "sha256sum not found"
+  mkdirp "${TARBALL_DIR}"
+
+  local zlib_tb="${TARBALL_DIR}/zlib-${ZLIB_VER}.tar.gz"
+  local openssl_tb="${TARBALL_DIR}/openssl-${OPENSSL_VER}.tar.gz"
+  local curl_tb="${TARBALL_DIR}/curl-${CURL_VER}.tar.gz"
+
+  download "${ZLIB_URL}" "${zlib_tb}"
+  download "${OPENSSL_URL}" "${openssl_tb}"
+  download "${CURL_URL}" "${curl_tb}"
+
+  echo
+  echo "Candidate integration hashes; verify these against upstream signatures before pinning:"
+  sha256sum "${zlib_tb}" "${openssl_tb}" "${curl_tb}"
 }
 
 extract() {
@@ -499,6 +597,9 @@ EOF
 build_binaries() {
   local cflags=(-O2)
   local sys=(--sysroot="${SYSROOT}")
+  local origin_rpath
+  # shellcheck disable=SC2016
+  origin_rpath='$ORIGIN/../lib'
 
   run_logged "build-hello-c"   tc gcc "${sys[@]}" "${cflags[@]}" "${WORK_DIR}/src/hello.c"   -o "${WORK_DIR}/bin/hello_c"
   run_logged "build-hello-cpp" tc g++ "${sys[@]}" "${cflags[@]}" "${WORK_DIR}/src/hello.cpp" -o "${WORK_DIR}/bin/hello_cpp"
@@ -516,7 +617,7 @@ build_binaries() {
 
   run_logged "build-dso-catch" tc g++ "${sys[@]}" "${cflags[@]}" \
     "${WORK_DIR}/src/dso_catch.cpp" -o "${WORK_DIR}/bin/dso_catch" \
-    -ldl -Wl,-rpath,'$ORIGIN/../lib'
+    -ldl -Wl,-rpath,"${origin_rpath}"
 
   # Make dlopen("./libthrow.so") succeed when running from WORK_DIR/bin
   run_logged "build-libthrow-symlink" bash -lc "
@@ -528,7 +629,7 @@ build_binaries() {
   # Threaded dlopen stress binary
   run_logged "build-dlopen-threads" tc g++ "${sys[@]}" "${cflags[@]}" \
     "${WORK_DIR}/src/dlopen_threads.cpp" -o "${WORK_DIR}/bin/dlopen_threads" \
-    -ldl -pthread -Wl,-rpath,'$ORIGIN/../lib'
+    -ldl -pthread -Wl,-rpath,"${origin_rpath}"
 
   # RTLD collision artifacts
   run_logged "build-libsym-a" tc gcc "${sys[@]}" "${cflags[@]}" -fPIC -shared \
@@ -539,7 +640,7 @@ build_binaries() {
     "${WORK_DIR}/src/sym_b.c" -o "${WORK_DIR}/lib/libsym_b.so"
   run_logged "build-rtld-collision" tc gcc "${sys[@]}" "${cflags[@]}" \
     "${WORK_DIR}/src/rtld_collision.c" -o "${WORK_DIR}/bin/rtld_collision" \
-    -ldl -Wl,-rpath,'$ORIGIN/../lib'
+    -ldl -Wl,-rpath,"${origin_rpath}"
 
   run_logged "build-symlink-sym-a" bash -lc "set -e; ln -sf ../lib/libsym_a.so '${WORK_DIR}/bin/libsym_a.so'; ls -l '${WORK_DIR}/bin/libsym_a.so'"
   run_logged "build-symlink-sym-b" bash -lc "set -e; ln -sf ../lib/libsym_b.so '${WORK_DIR}/bin/libsym_b.so'; ls -l '${WORK_DIR}/bin/libsym_b.so'"
@@ -558,6 +659,88 @@ inspect_elf() {
     echo '--- NEEDED ---'
     readelf -d '$bin' | grep -E 'NEEDED' || true
   "
+}
+
+assert_default_hardening() {
+  mkdirp "${WORK_DIR}/src" "${WORK_DIR}/bin"
+
+  cat > "${WORK_DIR}/src/hardening.c" <<'EOF'
+#include <stdio.h>
+#include <string.h>
+int main(int argc, char** argv){
+  char buf[64];
+  const char* s = argc > 1 ? argv[1] : "hardening";
+  snprintf(buf, sizeof(buf), "%s", s);
+  return (int)strlen(buf) == 0;
+}
+EOF
+
+  run_logged "hardening-build-defaults" tc gcc --sysroot="${SYSROOT}" -O2 \
+    "${WORK_DIR}/src/hardening.c" -o "${WORK_DIR}/bin/hardening_default"
+  run_logged "hardening-build-now" tc gcc --sysroot="${SYSROOT}" -O2 \
+    "${WORK_DIR}/src/hardening.c" -o "${WORK_DIR}/bin/hardening_now" \
+    -Wl,-z,now
+
+  run_logged "hardening-assert-defaults" bash -lc "
+    set -e
+    bin='${WORK_DIR}/bin/hardening_default'
+    nowbin='${WORK_DIR}/bin/hardening_now'
+
+    echo '--- ELF type ---'
+    readelf -h \"\${bin}\" | grep -E 'Type:[[:space:]]*DYN' >/dev/null
+    readelf -h \"\${bin}\" | grep -E 'Type:'
+
+    echo
+    echo '--- stack protector symbol ---'
+    readelf -Ws \"\${bin}\" | grep -E '__stack_chk_fail' >/dev/null
+    readelf -Ws \"\${bin}\" | grep -E '__stack_chk_fail' | head -n 5
+
+    echo
+    echo '--- RELRO segment ---'
+    readelf -l \"\${bin}\" | grep -E 'GNU_RELRO' >/dev/null
+    readelf -l \"\${bin}\" | grep -E 'GNU_RELRO'
+
+    echo
+    echo '--- non-executable stack ---'
+    readelf -W -l \"\${bin}\" | awk '/GNU_STACK/ { found=1; if (\$7 ~ /E/) exit 1 } END { exit found ? 0 : 2 }'
+    readelf -W -l \"\${bin}\" | grep -E 'GNU_STACK'
+
+    echo
+    echo '--- GNU hash section ---'
+    readelf -S \"\${bin}\" | grep -F '.gnu.hash' >/dev/null
+    readelf -S \"\${bin}\" | grep -F '.gnu.hash'
+
+    echo
+    echo '--- BIND_NOW with -z now ---'
+    readelf -d \"\${nowbin}\" | grep -E 'BIND_NOW|FLAGS.*NOW' >/dev/null
+    readelf -d \"\${nowbin}\" | grep -E 'BIND_NOW|FLAGS.*NOW'
+  "
+}
+
+assert_toolchain_runtime_libs() {
+  local libstdcxx libgcc libstdcxx_dir libgcc_dir
+
+  libstdcxx="$(tc g++ -print-file-name=libstdc++.so.6)"
+  libgcc="$(tc gcc -print-file-name=libgcc_s.so.1)"
+  libstdcxx_dir="$(dirname "${libstdcxx}")"
+  libgcc_dir="$(dirname "${libgcc}")"
+
+  [[ -f "${libstdcxx}" ]] || die "fresh libstdc++.so.6 not found via compiler: ${libstdcxx}"
+  [[ -f "${libgcc}" ]] || die "fresh libgcc not found via compiler: ${libgcc}"
+
+  run_logged "runtime-lib-provenance" bash -lc "
+    set -e
+    echo 'libstdcxx=${libstdcxx}'
+    echo 'libgcc=${libgcc}'
+    file '${libstdcxx}'
+    file '${libgcc}'
+    readelf -h '${libstdcxx}' | grep -E 'Machine:[[:space:]]*AArch64'
+    readelf -h '${libgcc}' | grep -E 'Machine:[[:space:]]*AArch64'
+  "
+
+  run_logged "qemu-run-hello-cpp-fresh-runtime" env \
+    LD_LIBRARY_PATH="${libstdcxx_dir}:${libgcc_dir}" \
+    "${QEMU_AARCH64}" -L "${SYSROOT}" "${WORK_DIR}/bin/hello_cpp"
 }
 
 # ------------------------------ Stress C++ -----------------------------------
@@ -625,13 +808,12 @@ export_integration_env() {
   export AR="${TC_PREFIX}/bin/${TARGET}-ar"
   export RANLIB="${TC_PREFIX}/bin/${TARGET}-ranlib"
   export STRIP="${TC_PREFIX}/bin/${TARGET}-strip"
-  export LD="${TC_PREFIX}/bin/${TARGET}-ld"
   export CFLAGS="${CFLAGS:--O2 -pipe} --sysroot=${SYSROOT}"
   export CXXFLAGS="${CXXFLAGS:--O2 -pipe} --sysroot=${SYSROOT}"
   export LDFLAGS="${LDFLAGS:-} --sysroot=${SYSROOT}"
 
   export PKG_CONFIG_SYSROOT_DIR="${SYSROOT}"
-  export PKG_CONFIG_LIBDIR="${SYSROOT}/usr/lib/aarch64-linux-gnu/pkgconfig:${SYSROOT}/usr/share/pkgconfig:${INSTALL_DIR}/lib/pkgconfig:${INSTALL_DIR}/share/pkgconfig"
+  export PKG_CONFIG_LIBDIR="${INSTALL_DIR}/lib/pkgconfig:${INSTALL_DIR}/share/pkgconfig:${SYSROOT}/usr/lib/aarch64-linux-gnu/pkgconfig:${SYSROOT}/usr/share/pkgconfig"
   export PKG_CONFIG_PATH="${INSTALL_DIR}/lib/pkgconfig:${INSTALL_DIR}/share/pkgconfig"
 }
 
@@ -660,6 +842,8 @@ integration_zlib() {
   local tb="${TARBALL_DIR}/zlib-${ZLIB_VER}.tar.gz"
   local src="${SRC_DIR}/zlib-${ZLIB_VER}"
   download "${ZLIB_URL}" "${tb}"
+  verify_sha256 "${tb}" "${ZLIB_SHA256}"
+  verify_gpg_signature "${tb}" "${ZLIB_SIG_URL}"
   [[ -d "${src}" && -f "${src}/configure" ]] || extract "${tb}" "${src}"
 
   run_logged "integration-zlib-configure" bash -lc "
@@ -678,6 +862,8 @@ integration_openssl() {
   local tb="${TARBALL_DIR}/openssl-${OPENSSL_VER}.tar.gz"
   local src="${SRC_DIR}/openssl-${OPENSSL_VER}"
   download "${OPENSSL_URL}" "${tb}"
+  verify_sha256 "${tb}" "${OPENSSL_SHA256}"
+  verify_gpg_signature "${tb}" "${OPENSSL_SIG_URL}"
   [[ -d "${src}" && -f "${src}/Configure" ]] || extract "${tb}" "${src}"
 
   run_logged "integration-openssl-configure" bash -lc "
@@ -699,6 +885,8 @@ integration_curl() {
   local tb="${TARBALL_DIR}/curl-${CURL_VER}.tar.gz"
   local src="${SRC_DIR}/curl-${CURL_VER}"
   download "${CURL_URL}" "${tb}"
+  verify_sha256 "${tb}" "${CURL_SHA256}"
+  verify_gpg_signature "${tb}" "${CURL_SIG_URL}"
   [[ -d "${src}" && -f "${src}/configure" ]] || extract "${tb}" "${src}"
 
   local extra_opts=()
@@ -741,7 +929,9 @@ integration_fixup_curl_rpath() {
   have_cmd readelf || die "missing readelf"
   have_cmd grep || die "missing grep"
 
-  local wanted_runpath='$ORIGIN/../lib:$ORIGIN/../lib64'
+  local wanted_runpath
+  # shellcheck disable=SC2016
+  wanted_runpath='$ORIGIN/../lib:$ORIGIN/../lib64'
 
   run_logged "integration-fixup-curl-rpath" bash -lc "
     set -e
@@ -970,7 +1160,7 @@ tier_report() {
     '${TC_PREFIX}/bin/${TARGET}-gcc' -print-search-dirs
     echo
     echo '--- sysroot loader ---'
-    ls -l '${SYSROOT}/lib/ld-linux-aarch64.so.1' || true
+    find '${SYSROOT}' -path '*ld-linux-aarch64.so.1' -print 2>/dev/null | sort
     echo
     echo '--- qemu ---'
     command -v '${QEMU_AARCH64}' >/dev/null 2>&1 && '${QEMU_AARCH64}' --version | head -n 1 || echo '(qemu not installed)'
@@ -1020,7 +1210,10 @@ tier_sanity() {
 
   sysroot_link_audit
 
+  assert_sysroot_abi
   build_binaries
+  assert_default_hardening
+  assert_toolchain_runtime_libs
   inspect_elf "${WORK_DIR}/bin/hello_c"
   inspect_elf "${WORK_DIR}/bin/hello_cpp"
   run_logged "qemu-run-hello-c"   qemu_run "${WORK_DIR}/bin/hello_c"
@@ -1035,8 +1228,11 @@ tier_smoke() {
   need_paths
   need_qemu
   mkdirp "${WORK_DIR}"
+  assert_sysroot_abi
   write_sources
   build_binaries
+  assert_default_hardening
+  assert_toolchain_runtime_libs
 
   if [[ "${STRESS_CPP}" == "1" ]]; then
     stress_cpp_compile
@@ -1079,9 +1275,14 @@ tier_smoke() {
 tier_nightly() {
   mark_tier_start "nightly"
   need_paths
+  have_cmd strings || die "missing strings"
   mkdirp "${WORK_DIR}"
   write_sources
   build_binaries
+
+  local sysroot_glibc
+  sysroot_glibc="$(sysroot_glibc_version || true)"
+  [[ -n "${sysroot_glibc}" ]] || die "could not determine sysroot glibc version from ${SYSROOT}"
 
   have_cmd ssh || die "missing ssh"
   have_cmd scp || die "missing scp"
@@ -1100,6 +1301,15 @@ tier_nightly() {
   run_logged "pi-run-suite" ssh -p "${PI_SSH_PORT}" "${PI_SSH}" "
     set -e
     cd '${PI_TMPDIR}'
+
+    pi_glibc=\$(getconf GNU_LIBC_VERSION | sed -nE 's/^glibc[[:space:]]+([0-9]+([.][0-9]+)+).*/\\1/p')
+    echo \"sysroot-glibc=${sysroot_glibc}\"
+    echo \"pi-glibc=\${pi_glibc}\"
+    if [[ -z \"\${pi_glibc}\" || \"\${pi_glibc}\" != '${sysroot_glibc}' ]]; then
+      echo \"ERROR: sysroot/Pi glibc mismatch\"
+      exit 9
+    fi
+
     './hello_c'
     './hello_cpp'
     './pthread'
@@ -1126,6 +1336,20 @@ tier_nightly() {
   tier_summary
 }
 
+tier_all() {
+  tier_report
+  tier_sanity
+  tier_smoke
+
+  if [[ "${RUN_NIGHTLY:-0}" == "1" || "${A_PLUS}" == "1" ]]; then
+    tier_nightly
+  else
+    log "RUN_NIGHTLY=0 and A_PLUS=0: skipping nightly in all"
+  fi
+
+  tier_summary
+}
+
 usage() {
   cat <<EOF
 test-cross-toolchain.sh (version ${SCRIPT_VERSION})
@@ -1135,6 +1359,8 @@ Usage:
   $0 sanity
   $0 smoke
   $0 nightly
+  $0 all
+  $0 fetch-integration-hashes
 
 One-liner A+ run:
   A_PLUS=1 $0 nightly
@@ -1149,6 +1375,7 @@ Nightly (runs on Pi):
   PI_SSH=${PI_SSH}
   PI_SSH_PORT=${PI_SSH_PORT}
   PI_TMPDIR=${PI_TMPDIR}
+  RUN_NIGHTLY=1             (include nightly in $0 all; A_PLUS=1 also includes it)
 
 Integration:
   INTEGRATION=1
@@ -1156,6 +1383,11 @@ Integration:
   PI_NET_TEST=1
   PI_NET_TEST_URL=https://example.com
   PI_TLS_SELFCONTAINED=1    (stages sysroot CA bundle + uses CURL_CA_BUNDLE on Pi)
+  VERIFY_INTEGRATION_DOWNLOADS=1
+  VERIFY_INTEGRATION_GPG=1  (requires trusted upstream signing keys; set 0 only for bootstrap/debug)
+  ZLIB_SHA256=...
+  OPENSSL_SHA256=...
+  CURL_SHA256=...
 
 Rare-failure stressors:
   STRESS_DLOPEN_THREADS=1
@@ -1174,14 +1406,15 @@ EOF
 
 main() {
   echo "Version: ${SCRIPT_VERSION}"
-  need_paths
 
   local cmd="${1:-}"
   case "${cmd}" in
+    fetch-integration-hashes) print_integration_hashes ;;
     report)  tier_report ;;
     sanity)  tier_sanity ;;
     smoke)   tier_smoke ;;
     nightly) tier_nightly ;;
+    all)     tier_all ;;
     ""|help|-h|--help) usage ;;
     *) die "unknown command: ${cmd}" ;;
   esac

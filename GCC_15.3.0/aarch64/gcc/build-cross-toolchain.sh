@@ -23,6 +23,22 @@ SYSROOT="${SYSROOT:-/build-rpi/rpi/sysroot}"
 TARGET_ARCH_BASE="${TARGET_ARCH_BASE:-armv8-a}"
 TARGET_TUNE="${TARGET_TUNE:-cortex-a72}"
 
+# Production linker/tool defaults. Keep these configurable because older host
+# distros may not have optional development libraries such as libzstd.
+BINUTILS_ZSTD="${BINUTILS_ZSTD:-auto}"
+GCC_ZSTD="${GCC_ZSTD:-auto}"
+DEFAULT_HASH_STYLE="${DEFAULT_HASH_STYLE:-gnu}"
+
+# Optional production packaging mode: copy the input sysroot into PREFIX and
+# configure the compiler against that installed copy.
+INSTALL_SYSROOT="${INSTALL_SYSROOT:-1}"
+INSTALLED_SYSROOT_REL="${INSTALLED_SYSROOT_REL:-${TARGET}/sysroot}"
+MANIFEST_FILE="${MANIFEST_FILE:-${PREFIX}/toolchain-manifest.txt}"
+
+# Optional source authenticity check. Enable only after importing and trusting
+# the expected upstream release keys in your local GnuPG keyring.
+VERIFY_GPG="${VERIFY_GPG:-1}"
+
 # Layout
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_ROOT="${SRC_ROOT:-${ROOT_DIR}/src}"
@@ -45,11 +61,13 @@ RECONFIGURE="${RECONFIGURE:-1}"
 
 # Internal guard: ensure we only clean PREFIX once per script invocation
 PREFIX_CLEANED=0
+SYSROOT_INSTALLED=0
 
 # ------------------------------ Versions / URLs -------------------------------
 # GCC
 GCC_TARBALL="${GCC_TARBALL:-gcc-${GCC_VER}.tar.xz}"
 GCC_URL="${GCC_URL:-https://ftp.gnu.org/gnu/gcc/gcc-${GCC_VER}/${GCC_TARBALL}}"
+GCC_SIG_URL="${GCC_SIG_URL:-${GCC_URL}.sig}"
 GCC_SHA256="${GCC_SHA256:-fa59c1beef8995f27c4d71c1df227587189315d3e6faff1bb4306e61b0c530eb}"
 GCC_SRC_DIR="${GCC_SRC_DIR:-${SRC_ROOT}/gcc-${GCC_VER}}"
 
@@ -57,6 +75,7 @@ GCC_SRC_DIR="${GCC_SRC_DIR:-${SRC_ROOT}/gcc-${GCC_VER}}"
 BINUTILS_VER="${BINUTILS_VER:-2.46.1}"
 BINUTILS_TARBALL="${BINUTILS_TARBALL:-binutils-${BINUTILS_VER}.tar.xz}"
 BINUTILS_URL="${BINUTILS_URL:-https://ftp.gnu.org/gnu/binutils/${BINUTILS_TARBALL}}"
+BINUTILS_SIG_URL="${BINUTILS_SIG_URL:-${BINUTILS_URL}.sig}"
 BINUTILS_SHA256="${BINUTILS_SHA256:-e127a709cba24c76de8936cb7083dd768f28cd37eb010492e2f19b71eb1294e4}"
 BINUTILS_SRC_DIR="${BINUTILS_SRC_DIR:-${SRC_ROOT}/binutils-${BINUTILS_VER}}"
 BINUTILS_BUILD_DIR="${BINUTILS_BUILD_DIR:-${BUILD_DIR}/binutils}"
@@ -123,6 +142,19 @@ verify_sha256() {
   echo "==> sha256 ok: $(basename "$file")"
 }
 
+verify_gpg_signature() {
+  local file="$1"
+  local sig_url="$2"
+  local sig="${file}.sig"
+
+  [[ "${VERIFY_GPG}" == "1" ]] || return 0
+  have_cmd gpg || die "VERIFY_GPG=1 requires gpg"
+
+  download_file "${sig_url}" "${sig}"
+  gpg --verify "${sig}" "${file}"
+  echo "==> gpg signature ok: $(basename "$file")"
+}
+
 extract_tarball() {
   local tarball="$1"
   local dest="$2"
@@ -158,6 +190,7 @@ ensure_gcc_source() {
     local tb="${TARBALL_DIR}/${GCC_TARBALL}"
     download_file "${GCC_URL}" "${tb}"
     verify_sha256 "${tb}" "${GCC_SHA256}"
+    verify_gpg_signature "${tb}" "${GCC_SIG_URL}"
     extract_tarball "${tb}" "${GCC_SRC_DIR}"
   fi
 
@@ -176,6 +209,7 @@ ensure_binutils_source() {
   local tb="${TARBALL_DIR}/${BINUTILS_TARBALL}"
   download_file "${BINUTILS_URL}" "${tb}"
   verify_sha256 "${tb}" "${BINUTILS_SHA256}"
+  verify_gpg_signature "${tb}" "${BINUTILS_SIG_URL}"
   extract_tarball "${tb}" "${BINUTILS_SRC_DIR}"
 }
 
@@ -235,6 +269,97 @@ require_binutils_in_prefix() {
   [[ -x "${PREFIX}/bin/${TARGET}-ld" ]] || die "missing ${PREFIX}/bin/${TARGET}-ld (binutils not installed or prefix cleaned)"
 }
 
+build_triplet() {
+  if have_cmd gcc; then
+    gcc -dumpmachine
+  elif [[ -x "${BINUTILS_SRC_DIR}/config.guess" ]]; then
+    "${BINUTILS_SRC_DIR}/config.guess"
+  elif [[ -x "${GCC_SRC_DIR}/config.guess" ]]; then
+    "${GCC_SRC_DIR}/config.guess"
+  else
+    die "cannot determine build triplet; install host gcc or set BUILD_TRIPLET"
+  fi
+}
+
+effective_sysroot() {
+  if [[ "${INSTALL_SYSROOT}" == "1" ]]; then
+    printf '%s/%s\n' "${PREFIX}" "${INSTALLED_SYSROOT_REL}"
+  else
+    printf '%s\n' "${SYSROOT}"
+  fi
+}
+
+install_sysroot_if_requested() {
+  [[ "${INSTALL_SYSROOT}" == "1" ]] || return 0
+  [[ "${SYSROOT_INSTALLED}" == "0" ]] || return 0
+  require_sysroot
+  have_cmd rsync || die "INSTALL_SYSROOT=1 requires rsync"
+
+  local dest
+  dest="$(effective_sysroot)"
+  [[ -n "${dest}" && "${dest}" != "/" ]] || die "refusing dangerous installed sysroot path: ${dest}"
+  mkdirp "${dest}"
+
+  log_step "install-sysroot" rsync -a --delete \
+    --exclude='/dev/*' \
+    --exclude='/proc/*' \
+    --exclude='/sys/*' \
+    --exclude='/tmp/*' \
+    "${SYSROOT}/" "${dest}/"
+  SYSROOT_INSTALLED=1
+}
+
+libc_version_from_sysroot() {
+  local libc
+  libc="$(find "${SYSROOT}" -type f -name 'libc.so.6' -print -quit 2>/dev/null || true)"
+  if [[ -n "${libc}" ]]; then
+    strings "${libc}" 2>/dev/null | grep -E '^GNU C Library|^glibc ' | head -n 1 || true
+  fi
+}
+
+write_manifest() {
+  export_basic_env
+  mkdirp "$(dirname "${MANIFEST_FILE}")"
+
+  local effective build host
+  effective="$(effective_sysroot)"
+  build="${BUILD_TRIPLET:-$(build_triplet)}"
+  host="${HOST_TRIPLET:-${build}}"
+
+  {
+    echo "toolchain_manifest_version=1"
+    echo "script_version=${SCRIPT_VERSION}"
+    echo "generated_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "target=${TARGET}"
+    echo "build_triplet=${build}"
+    echo "host_triplet=${host}"
+    echo "prefix=${PREFIX}"
+    echo "source_sysroot=${SYSROOT}"
+    echo "effective_sysroot=${effective}"
+    echo "install_sysroot=${INSTALL_SYSROOT}"
+    echo "gcc_version=${GCC_VER}"
+    echo "gcc_tarball=${GCC_TARBALL}"
+    echo "gcc_sha256=${GCC_SHA256}"
+    echo "binutils_version=${BINUTILS_VER}"
+    echo "binutils_tarball=${BINUTILS_TARBALL}"
+    echo "binutils_sha256=${BINUTILS_SHA256}"
+    echo "target_arch_base=${TARGET_ARCH_BASE}"
+    echo "target_tune=${TARGET_TUNE}"
+    echo "default_hash_style=${DEFAULT_HASH_STYLE}"
+    echo "binutils_zstd=${BINUTILS_ZSTD}"
+    echo "gcc_zstd=${GCC_ZSTD}"
+    echo "libc_version=$(libc_version_from_sysroot)"
+    echo
+    echo "[configure.binutils]"
+    echo "--build=${build} --host=${host} --target=${TARGET} --prefix=${PREFIX} --with-sysroot=${effective} --disable-multilib --disable-werror --disable-nls --enable-plugins --enable-lto --enable-ld=default --enable-relro --enable-default-hash-style=${DEFAULT_HASH_STYLE} --with-zstd=${BINUTILS_ZSTD} --with-system-zlib"
+    echo
+    echo "[configure.gcc]"
+    echo "--build=${build} --host=${host} --target=${TARGET} --prefix=${PREFIX} --with-sysroot=${effective} --with-build-sysroot=${effective} --with-native-system-header-dir=/usr/include --enable-multiarch --disable-multilib --enable-languages=c,c++ --enable-shared --enable-threads=posix --enable-linker-build-id --enable-plugin --enable-lto --with-system-zlib --with-arch=${TARGET_ARCH_BASE} --with-tune=${TARGET_TUNE} --disable-bootstrap --enable-default-pie --enable-default-ssp"
+  } > "${MANIFEST_FILE}"
+
+  echo "==> manifest written: ${MANIFEST_FILE}"
+}
+
 # ----------------------------- Build: binutils --------------------------------
 build_binutils() {
   export_basic_env
@@ -245,20 +370,31 @@ build_binutils() {
   have_cmd gcc || die "missing host gcc"
 
   clean_prefix_once
+  install_sysroot_if_requested
   mkdirp "${BINUTILS_BUILD_DIR}"
+
+  local build host sysroot_for_build
+  build="${BUILD_TRIPLET:-$(build_triplet)}"
+  host="${HOST_TRIPLET:-${build}}"
+  sysroot_for_build="$(effective_sysroot)"
 
   log_step "configure-binutils" bash -lc "
     cd '${BINUTILS_BUILD_DIR}'
     '${BINUTILS_SRC_DIR}/configure' \
+      --build='${build}' \
+      --host='${host}' \
       --target='${TARGET}' \
       --prefix='${PREFIX}' \
-      --with-sysroot='${SYSROOT}' \
+      --with-sysroot='${sysroot_for_build}' \
       --disable-multilib \
       --disable-werror \
       --disable-nls \
       --enable-plugins \
       --enable-lto \
       --enable-ld=default \
+      --enable-relro \
+      --enable-default-hash-style='${DEFAULT_HASH_STYLE}' \
+      --with-zstd='${BINUTILS_ZSTD}' \
       --with-system-zlib
   "
 
@@ -287,7 +423,11 @@ build_toolchain() {
 
   # If CLEAN_PREFIX=1 and user ran only "gcc", this would nuke the prefix.
   # Keep behavior consistent: only clean once per invocation, but also ensure binutils exist.
+  if [[ "${CLEAN_PREFIX}" == "1" && "${PREFIX_CLEANED}" == "0" ]]; then
+    die "CLEAN_PREFIX=1 with command 'gcc' would remove installed binutils. Run '$0 build' or '$0 binutils' first."
+  fi
   clean_prefix_once
+  install_sysroot_if_requested
 
   # Binutils must exist for target compilation tests (libgcc configure)
   require_binutils_in_prefix
@@ -302,20 +442,34 @@ build_toolchain() {
 
   local with_as=""
   local with_ld=""
+  local with_zstd=""
   if [[ -x "${PREFIX}/bin/${TARGET}-as" ]]; then
     with_as="--with-as=${PREFIX}/bin/${TARGET}-as"
   fi
   if [[ -x "${PREFIX}/bin/${TARGET}-ld" ]]; then
     with_ld="--with-ld=${PREFIX}/bin/${TARGET}-ld"
   fi
+  case "${GCC_ZSTD}" in
+    auto) with_zstd="" ;;
+    yes|system) with_zstd="--with-zstd" ;;
+    no) with_zstd="--without-zstd" ;;
+    *) with_zstd="--with-zstd=${GCC_ZSTD}" ;;
+  esac
+
+  local build host sysroot_for_build
+  build="${BUILD_TRIPLET:-$(build_triplet)}"
+  host="${HOST_TRIPLET:-${build}}"
+  sysroot_for_build="$(effective_sysroot)"
 
   log_step "configure-gcc-final" bash -lc "
     cd '${gcc_build}'
     '${GCC_SRC_DIR}/configure' \
+      --build='${build}' \
+      --host='${host}' \
       --target='${TARGET}' \
       --prefix='${PREFIX}' \
-      --with-sysroot='${SYSROOT}' \
-      --with-build-sysroot='${SYSROOT}' \
+      --with-sysroot='${sysroot_for_build}' \
+      --with-build-sysroot='${sysroot_for_build}' \
       --with-native-system-header-dir=/usr/include \
       --enable-multiarch \
       --disable-multilib \
@@ -326,6 +480,7 @@ build_toolchain() {
       --enable-plugin \
       --enable-lto \
       --with-system-zlib \
+      ${with_zstd} \
       --without-included-gettext \
       --enable-checking=release \
       --disable-werror \
@@ -349,6 +504,7 @@ build_toolchain() {
 
   echo
   echo "==> GCC installed to ${PREFIX}"
+  write_manifest
 }
 
 build_all() {
@@ -372,6 +528,15 @@ Env toggles:
   RECONFIGURE=0       Reuse existing gcc build dir (not recommended)
   TARGET_ARCH_BASE=   Default arch for GCC (default: armv8-a)
   TARGET_TUNE=        Default tune for GCC (default: cortex-a72)
+  BINUTILS_ZSTD=      zstd support mode for binutils (default: auto)
+  GCC_ZSTD=           GCC zstd mode: auto, yes/system, no, or prefix path (default: auto)
+  DEFAULT_HASH_STYLE= GNU ld default hash style (default: gnu)
+  INSTALL_SYSROOT=    Copy SYSROOT into PREFIX/${INSTALLED_SYSROOT_REL} (default: ${INSTALL_SYSROOT})
+  INSTALLED_SYSROOT_REL= Relative installed sysroot path (default: ${TARGET}/sysroot)
+  MANIFEST_FILE=      Build manifest output (default: ${MANIFEST_FILE})
+  VERIFY_GPG=         Verify source .sig files with local trusted GnuPG keys (default: ${VERIFY_GPG})
+  BUILD_TRIPLET=      Override detected build triplet
+  HOST_TRIPLET=       Override host triplet for generated tools
 
 Dirs:
   SRC_ROOT=${SRC_ROOT}
