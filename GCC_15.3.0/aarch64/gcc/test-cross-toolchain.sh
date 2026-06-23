@@ -151,6 +151,71 @@ tier_summary() {
     fi
   done
   echo "======================================================"
+  write_validation_report
+}
+
+write_validation_report() {
+  local report="${LOG_DIR}/validation-report.txt"
+  local sdir="${LOG_DIR}/.status"
+  local sysroot_glibc=""
+  sysroot_glibc="$(sysroot_glibc_version 2>/dev/null || true)"
+
+  mkdirp "${LOG_DIR}"
+  {
+    echo "validation_report_version=1"
+    echo "generated_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "script_version=${SCRIPT_VERSION}"
+    echo
+    echo "[toolchain]"
+    echo "target=${TARGET}"
+    echo "tc_prefix=${TC_PREFIX}"
+    echo "sysroot=${SYSROOT}"
+    echo "sysroot_glibc=${sysroot_glibc}"
+    if [[ -x "${TC_PREFIX}/bin/${TARGET}-gcc" ]]; then
+      echo "gcc_version=$("${TC_PREFIX}/bin/${TARGET}-gcc" -dumpfullversion -dumpversion 2>/dev/null || true)"
+      echo "gcc_machine=$("${TC_PREFIX}/bin/${TARGET}-gcc" -dumpmachine 2>/dev/null || true)"
+      echo "gcc_configured_sysroot=$("${TC_PREFIX}/bin/${TARGET}-gcc" -print-sysroot 2>/dev/null || true)"
+    fi
+    if [[ -x "${TC_PREFIX}/bin/${TARGET}-ld" ]]; then
+      echo "ld_version=$("${TC_PREFIX}/bin/${TARGET}-ld" --version 2>/dev/null | head -n 1 || true)"
+    fi
+    echo
+    echo "[tiers]"
+    for t in report sanity smoke nightly; do
+      if [[ -f "${sdir}/${t}.status" ]]; then
+        echo "${t}=$(cat "${sdir}/${t}.status")"
+      else
+        echo "${t}=NOT_RUN"
+      fi
+    done
+    echo
+    echo "[validation_toggles]"
+    echo "a_plus=${A_PLUS}"
+    echo "sysroot_link_audit=${SYSROOT_LINK_AUDIT}"
+    echo "integration=${INTEGRATION}"
+    echo "integration_run_on_pi=${INTEGRATION_RUN_ON_PI}"
+    echo "pi_net_test=${PI_NET_TEST}"
+    echo "pi_tls_selfcontained=${PI_TLS_SELFCONTAINED}"
+    echo "verify_integration_downloads=${VERIFY_INTEGRATION_DOWNLOADS}"
+    echo "verify_integration_gpg=${VERIFY_INTEGRATION_GPG}"
+    echo "stress_dlopen_threads=${STRESS_DLOPEN_THREADS}"
+    echo "stress_dlopen_threads_n=${STRESS_DLOPEN_THREADS_N}"
+    echo "stress_dlopen_iters=${STRESS_DLOPEN_ITERS}"
+    echo "stress_rtld_collision=${STRESS_RTLD_COLLISION}"
+    echo "stress_openssl_tls=${STRESS_OPENSSL_TLS}"
+    echo
+    echo "[target_pi]"
+    echo "pi_ssh=${PI_SSH}"
+    echo "pi_ssh_port=${PI_SSH_PORT}"
+    echo "pi_tmpdir=${PI_TMPDIR}"
+    echo "pi_integration_dir=${PI_INTEGRATION_DIR}"
+    echo "pi_net_test_url=${PI_NET_TEST_URL}"
+    echo
+    echo "[logs]"
+    echo "log_dir=${LOG_DIR}"
+  } > "${report}"
+
+  echo "==> validation report: ${report}"
 }
 
 # ------------------------------ Helpers ---------------------------------------

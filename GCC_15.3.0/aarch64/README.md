@@ -29,6 +29,18 @@ Import and trust the upstream release-signing keys before building. For a
 temporary bootstrap/debug run only, the GPG checks can be disabled with
 `VERIFY_GPG=0` or `VERIFY_INTEGRATION_GPG=0`.
 
+Before relying on the GPG checks, confirm imported key fingerprints from the
+official project release pages for:
+
+- GNU/GCC release signing keys
+- GNU/binutils release signing keys
+- zlib release signing keys
+- OpenSSL release signing keys
+- curl release signing keys
+
+Keep a copy of the confirmed fingerprints with your release records. Do not
+treat an arbitrary locally trusted key as sufficient provenance.
+
 ## Strongest GCC/glibc Validation
 
 Run from this `aarch64` directory:
@@ -43,6 +55,16 @@ Print candidate source hashes if updating pinned versions:
 gcc/build-cross-toolchain.sh fetch-hashes
 gcc/test-cross-toolchain.sh fetch-integration-hashes
 ```
+
+Run the host preflight check:
+
+```sh
+gcc/build-cross-toolchain.sh verify-host
+```
+
+This must pass with `VERIFY_GPG=1` before a production build. If it fails on
+missing `gpg` or untrusted keys, install/import the signing keys rather than
+disabling verification.
 
 Build the production cross toolchain:
 
@@ -97,6 +119,12 @@ The GCC/glibc test suite validates:
   `BIND_NOW` behavior
 - integration cross-builds for zlib, OpenSSL, and curl
 - curl/OpenSSL TLS behavior on the Pi
+
+Each run updates:
+
+```text
+gcc/logs-tests/validation-report.txt
+```
 
 ## Musl Companion
 

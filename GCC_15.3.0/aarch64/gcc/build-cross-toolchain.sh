@@ -269,6 +269,103 @@ require_binutils_in_prefix() {
   [[ -x "${PREFIX}/bin/${TARGET}-ld" ]] || die "missing ${PREFIX}/bin/${TARGET}-ld (binutils not installed or prefix cleaned)"
 }
 
+verify_host() {
+  export_basic_env
+
+  local required=(
+    bash
+    make
+    gcc
+    g++
+    tar
+    find
+    awk
+    sed
+    grep
+    sha256sum
+    strings
+  )
+  local recommended=(
+    curl
+    wget
+    bison
+    flex
+    makeinfo
+    rsync
+    gpg
+    pkg-config
+    qemu-aarch64
+    patchelf
+    ssh
+    scp
+  )
+
+  local missing=0 cmd
+  echo "==> host required tools"
+  for cmd in "${required[@]}"; do
+    if have_cmd "${cmd}"; then
+      printf '  ok   %s -> %s\n' "${cmd}" "$(command -v "${cmd}")"
+    else
+      printf '  MISS %s\n' "${cmd}"
+      missing=1
+    fi
+  done
+
+  if ! have_cmd curl && ! have_cmd wget; then
+    echo "  MISS curl or wget (one is required for downloads)"
+    missing=1
+  fi
+  if [[ "${INSTALL_SYSROOT}" == "1" ]] && ! have_cmd rsync; then
+    echo "  MISS rsync (required because INSTALL_SYSROOT=1)"
+    missing=1
+  fi
+  if [[ "${VERIFY_GPG}" == "1" ]] && ! have_cmd gpg; then
+    echo "  MISS gpg (required because VERIFY_GPG=1)"
+    missing=1
+  fi
+
+  echo
+  echo "==> host recommended tools"
+  for cmd in "${recommended[@]}"; do
+    if have_cmd "${cmd}"; then
+      printf '  ok   %s -> %s\n' "${cmd}" "$(command -v "${cmd}")"
+    else
+      printf '  WARN %s not found\n' "${cmd}"
+    fi
+  done
+
+  echo
+  echo "==> host development headers"
+  if printf '#include <zlib.h>\nint main(void){return 0;}\n' | gcc -x c - -lz -o /tmp/gcc-toolchain-zlib-check.$$ >/dev/null 2>&1; then
+    echo "  ok   zlib headers/library"
+    rm -f /tmp/gcc-toolchain-zlib-check.$$
+  else
+    echo "  MISS zlib headers/library (needed for --with-system-zlib)"
+    missing=1
+  fi
+
+  if printf '#include <zstd.h>\nint main(void){return 0;}\n' | gcc -x c - -lzstd -o /tmp/gcc-toolchain-zstd-check.$$ >/dev/null 2>&1; then
+    echo "  ok   zstd headers/library"
+    rm -f /tmp/gcc-toolchain-zstd-check.$$
+  else
+    echo "  WARN zstd headers/library not found; zstd support may be disabled or configure may fail if forced"
+  fi
+
+  echo
+  echo "==> host summary"
+  echo "  TARGET=${TARGET}"
+  echo "  PREFIX=${PREFIX}"
+  echo "  SYSROOT=${SYSROOT}"
+  echo "  INSTALL_SYSROOT=${INSTALL_SYSROOT}"
+  echo "  VERIFY_GPG=${VERIFY_GPG}"
+  echo "  BUILD_TRIPLET=${BUILD_TRIPLET:-$(build_triplet)}"
+
+  require_sysroot
+  echo "  sysroot ok: ${SYSROOT}"
+  [[ "${missing}" == "0" ]] || die "host verification failed"
+  echo "==> verify-host: PASS"
+}
+
 build_triplet() {
   if have_cmd gcc; then
     gcc -dumpmachine
@@ -518,6 +615,7 @@ usage() {
 Usage: $0 <command>
 
 Commands:
+  verify-host  Check host tools, libraries, GPG/download tools, and SYSROOT
   fetch-hashes Download source archives and print candidate SHA256 values
   binutils   Download/extract (if needed) + build+install cross binutils into PREFIX
   gcc        Download/extract (if needed) + build+install final GCC (C,C++) into PREFIX
@@ -550,6 +648,7 @@ main() {
   echo "Version: $SCRIPT_VERSION"
   local cmd="${1:-}"
   case "${cmd}" in
+    verify-host)  verify_host ;;
     fetch-hashes) print_source_hashes ;;
     binutils) build_binutils ;;
     gcc)      build_toolchain ;;
