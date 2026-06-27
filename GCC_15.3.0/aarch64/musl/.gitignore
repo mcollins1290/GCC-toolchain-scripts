@@ -4,6 +4,7 @@
 # But track these two scripts
 !build-musl-cross-toolchain.sh
 !test-musl-cross-toolchain.sh
+!README.md
 
 # (Optional) also track the .gitignore itself
 !.gitignore

@@ -61,18 +61,32 @@ STRESS_DLOPEN_ITERS="${STRESS_DLOPEN_ITERS:-250}"
 STRESS_RTLD_COLLISION="${STRESS_RTLD_COLLISION:-1}"
 STRESS_OPENSSL_TLS="${STRESS_OPENSSL_TLS:-1}"
 
-# A+ extra tests (optional)
+# A+ production validation extras
 STRESS_LTO_MATRIX="${STRESS_LTO_MATRIX:-0}"         # build LTO a few ways
 STRESS_STRIP_VERIFY="${STRESS_STRIP_VERIFY:-1}"     # ensure strip doesn't break runtime (dynamic only)
 STRESS_LIBSTDCPP_ABI="${STRESS_LIBSTDCPP_ABI:-1}"   # small C++ ABI sanity (dynamic+static ok)
 
 ZLIB_VER="${ZLIB_VER:-1.3.2}"
+ZLIB_URL="${ZLIB_URL:-https://zlib.net/zlib-${ZLIB_VER}.tar.gz}"
+ZLIB_SIG_URL="${ZLIB_SIG_URL:-${ZLIB_URL}.asc}"
+ZLIB_SHA256="${ZLIB_SHA256:-bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16}"
+ZLIB_GPG_FPR="${ZLIB_GPG_FPR:-5ED46A6721D365587791E2AA783FCD8E58BCAFBA}"
 
 OPENSSL_VER="${OPENSSL_VER:-3.5.7}"
 OPENSSL_URL="${OPENSSL_URL:-https://www.openssl.org/source/openssl-${OPENSSL_VER}.tar.gz}"
+OPENSSL_SIG_URL="${OPENSSL_SIG_URL:-${OPENSSL_URL}.asc}"
+OPENSSL_SHA256="${OPENSSL_SHA256:-a8c0d28a529ca480f9f36cf5792e2cd21984552a3c8e4aa11a24aa31aeac98e8}"
+OPENSSL_GPG_FPR="${OPENSSL_GPG_FPR:-BA5473A2B0587B07FB27CF2D216094DFD0CB81EF}"
 
 CURL_VER="${CURL_VER:-8.20.0}"
 CURL_URL="${CURL_URL:-https://curl.se/download/curl-${CURL_VER}.tar.gz}"
+CURL_SIG_URL="${CURL_SIG_URL:-${CURL_URL}.asc}"
+CURL_SHA256="${CURL_SHA256:-fc5819cad3f9f5482669adcdc49a782c15f36d2a0715b395b06d9173593d2dc0}"
+CURL_GPG_FPR="${CURL_GPG_FPR:-27EDEAF22F3ABCEB50DB9A125CC908FDB71E12C2}"
+
+VERIFY_INTEGRATION_DOWNLOADS="${VERIFY_INTEGRATION_DOWNLOADS:-1}"
+VERIFY_INTEGRATION_GPG="${VERIFY_INTEGRATION_GPG:-1}"
+INTEGRATION_SOURCE_REFRESH="${INTEGRATION_SOURCE_REFRESH:-1}"
 
 CURL_DISABLE_LIBPSL="${CURL_DISABLE_LIBPSL:-1}"
 CURL_DISABLE_BROTLI="${CURL_DISABLE_BROTLI:-1}"
@@ -91,9 +105,17 @@ INSTALL_DIR="${INSTALL_DIR:-${CACHE_DIR}/install/${TARGET}}"
 
 KEEP_WORKDIR="${KEEP_WORKDIR:-0}"
 KEEP_CACHE="${KEEP_CACHE:-1}"
+FRESH_LOGS="${FRESH_LOGS:-1}"
 
 # ------------------------------ A+ Super Suite Switch --------------------------
 A_PLUS="${A_PLUS:-0}"
+case "${A_PLUS}" in
+  0|1) ;;
+  *)
+    echo "ERROR: A_PLUS must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
 if [[ "${A_PLUS}" == "1" ]]; then
   echo "A_PLUS=1: enabling full integration + stress suite"
 
@@ -110,8 +132,8 @@ if [[ "${A_PLUS}" == "1" ]]; then
 
   STRESS_CPP=1
   STRESS_DLOPEN_THREADS=1
-  STRESS_DLOPEN_THREADS_N="${STRESS_DLOPEN_THREADS_N:-6}"
-  STRESS_DLOPEN_ITERS="${STRESS_DLOPEN_ITERS:-750}"
+  STRESS_DLOPEN_THREADS_N="${A_PLUS_DLOPEN_THREADS_N:-6}"
+  STRESS_DLOPEN_ITERS="${A_PLUS_DLOPEN_ITERS:-750}"
 
   STRESS_RTLD_COLLISION=1
   STRESS_OPENSSL_TLS=1
@@ -130,7 +152,9 @@ on_err() {
   if [[ -n "${CURRENT_TIER}" ]]; then
     echo
     echo ">>> ${CURRENT_TIER}: FAIL (exit=${exit_code})"
-    [[ -n "${TIER_STATUS_DIR}" ]] && echo "FAIL" > "${TIER_STATUS_DIR}/${CURRENT_TIER}.status" 2>/dev/null || true
+    if [[ -n "${TIER_STATUS_DIR}" ]]; then
+      echo "FAIL" > "${TIER_STATUS_DIR}/${CURRENT_TIER}.status" 2>/dev/null || true
+    fi
   else
     echo
     echo ">>> FAIL (exit=${exit_code})"
@@ -167,6 +191,85 @@ tier_summary() {
     fi
   done
   echo "======================================================"
+  write_validation_report
+}
+
+musl_version_from_sysroot() {
+  local libc
+  libc="$(find "${SYSROOT}" -type f -name 'libc.so' -print -quit 2>/dev/null || true)"
+  if [[ -n "${libc}" ]]; then
+    strings "${libc}" 2>/dev/null | grep -E '^Version [0-9]+([.][0-9]+)+' | head -n 1 || true
+  fi
+}
+
+write_validation_report() {
+  local report="${LOG_DIR}/validation-report.txt"
+  local sdir="${LOG_DIR}/.status"
+  local musl_version=""
+  musl_version="$(musl_version_from_sysroot 2>/dev/null || true)"
+
+  mkdirp "${LOG_DIR}"
+  {
+    echo "validation_report_version=1"
+    echo "generated_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "script_version=${SCRIPT_VERSION}"
+    echo
+    echo "[toolchain]"
+    echo "target=${TARGET}"
+    echo "tc_prefix=${TC_PREFIX}"
+    echo "sysroot=${SYSROOT}"
+    echo "link_mode=${LINK_MODE}"
+    echo "musl_version=${musl_version}"
+    if [[ -x "${TC_PREFIX}/bin/${TARGET}-gcc" ]]; then
+      echo "gcc_version=$("${TC_PREFIX}/bin/${TARGET}-gcc" -dumpfullversion -dumpversion 2>/dev/null || true)"
+      echo "gcc_machine=$("${TC_PREFIX}/bin/${TARGET}-gcc" -dumpmachine 2>/dev/null || true)"
+      echo "gcc_configured_sysroot=$("${TC_PREFIX}/bin/${TARGET}-gcc" -print-sysroot 2>/dev/null || true)"
+    fi
+    if [[ -x "${TC_PREFIX}/bin/${TARGET}-ld" ]]; then
+      echo "ld_version=$("${TC_PREFIX}/bin/${TARGET}-ld" --version 2>/dev/null | head -n 1 || true)"
+    fi
+    echo
+    echo "[tiers]"
+    for t in report sanity smoke nightly; do
+      if [[ -f "${sdir}/${t}.status" ]]; then
+        echo "${t}=$(cat "${sdir}/${t}.status")"
+      else
+        echo "${t}=NOT_RUN"
+      fi
+    done
+    echo
+    echo "[validation_toggles]"
+    echo "a_plus=${A_PLUS}"
+    echo "sysroot_link_audit=${SYSROOT_LINK_AUDIT}"
+    echo "integration=${INTEGRATION}"
+    echo "integration_run_on_pi=${INTEGRATION_RUN_ON_PI}"
+    echo "pi_net_test=${PI_NET_TEST}"
+    echo "pi_tls_selfcontained=${PI_TLS_SELFCONTAINED}"
+    echo "verify_integration_downloads=${VERIFY_INTEGRATION_DOWNLOADS}"
+    echo "verify_integration_gpg=${VERIFY_INTEGRATION_GPG}"
+    echo "integration_source_refresh=${INTEGRATION_SOURCE_REFRESH}"
+    echo "stress_cpp=${STRESS_CPP}"
+    echo "stress_dlopen_threads=${STRESS_DLOPEN_THREADS}"
+    echo "stress_dlopen_threads_n=${STRESS_DLOPEN_THREADS_N}"
+    echo "stress_dlopen_iters=${STRESS_DLOPEN_ITERS}"
+    echo "stress_rtld_collision=${STRESS_RTLD_COLLISION}"
+    echo "stress_openssl_tls=${STRESS_OPENSSL_TLS}"
+    echo "stress_lto_matrix=${STRESS_LTO_MATRIX}"
+    echo "stress_strip_verify=${STRESS_STRIP_VERIFY}"
+    echo "stress_libstdcpp_abi=${STRESS_LIBSTDCPP_ABI}"
+    echo
+    echo "[target_pi]"
+    echo "pi_ssh=${PI_SSH}"
+    echo "pi_ssh_port=${PI_SSH_PORT}"
+    echo "pi_tmpdir=${PI_TMPDIR}"
+    echo "pi_integration_dir=${PI_INTEGRATION_DIR}"
+    echo "pi_net_test_url=${PI_NET_TEST_URL}"
+    echo
+    echo "[logs]"
+    echo "log_dir=${LOG_DIR}"
+  } > "${report}"
+
+  echo "==> validation report: ${report}"
 }
 
 # ------------------------------ Helpers ---------------------------------------
@@ -175,6 +278,59 @@ mkdirp() { mkdir -p "$@"; }
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
+
+reset_logs_for_run() {
+  [[ "${FRESH_LOGS}" == "1" ]] || return 0
+
+  mkdirp "${LOG_DIR}"
+  rm -f "${LOG_DIR}"/*.log "${LOG_DIR}/validation-report.txt"
+  rm -rf "${LOG_DIR}/.status"
+}
+
+validate_settings() {
+  local bool_name bool_value
+
+  for bool_name in \
+    FRESH_LOGS \
+    VERIFY_INTEGRATION_DOWNLOADS \
+    VERIFY_INTEGRATION_GPG \
+    INTEGRATION_SOURCE_REFRESH \
+    INTEGRATION \
+    INTEGRATION_RUN_ON_PI \
+    PI_NET_TEST \
+    PI_TLS_SELFCONTAINED \
+    CURL_DISABLE_LIBPSL \
+    CURL_DISABLE_BROTLI \
+    SYSROOT_LINK_AUDIT \
+    KEEP_WORKDIR \
+    KEEP_CACHE \
+    STRESS_CPP \
+    STRESS_DLOPEN_THREADS \
+    STRESS_RTLD_COLLISION \
+    STRESS_OPENSSL_TLS \
+    STRESS_LTO_MATRIX \
+    STRESS_STRIP_VERIFY \
+    STRESS_LIBSTDCPP_ABI
+  do
+    bool_value="${!bool_name}"
+    case "${bool_value}" in
+      0|1) ;;
+      *) die "${bool_name} must be 0 or 1" ;;
+    esac
+  done
+
+  case "${LINK_MODE}" in
+    auto|static|dynamic) ;;
+    *) die "LINK_MODE must be auto, static, or dynamic" ;;
+  esac
+  case "${FRESH_LOGS}" in
+    0|1) ;;
+    *) die "FRESH_LOGS must be 0 or 1" ;;
+  esac
+
+  [[ "${STRESS_DLOPEN_THREADS_N}" =~ ^[1-9][0-9]*$ ]] || die "STRESS_DLOPEN_THREADS_N must be a positive integer"
+  [[ "${STRESS_DLOPEN_ITERS}" =~ ^[1-9][0-9]*$ ]] || die "STRESS_DLOPEN_ITERS must be a positive integer"
+}
 
 run_logged() {
   local name="$1"; shift
@@ -301,6 +457,64 @@ download_try() {
   done
 
   die "all download attempts failed for: $out"
+}
+
+verify_sha256() {
+  local file="$1"
+  local expect="$2"
+
+  [[ "${VERIFY_INTEGRATION_DOWNLOADS}" == "1" ]] || return 0
+  [[ -n "${expect}" ]] || die "missing SHA256 for $(basename "${file}"). Set the matching *_SHA256 or VERIFY_INTEGRATION_DOWNLOADS=0."
+  have_cmd sha256sum || die "sha256sum not found"
+
+  local got
+  got="$(sha256sum "${file}" | awk '{print $1}')"
+  [[ "${got}" == "${expect}" ]] || die "SHA256 mismatch for ${file}: got ${got}, expected ${expect}"
+  echo "==> sha256 ok: $(basename "${file}")"
+}
+
+normalize_fpr() {
+  tr '[:lower:]' '[:upper:]' <<< "${1//[[:space:]]/}"
+}
+
+verify_gpg_signature() {
+  local file="$1"
+  local sig_url="$2"
+  local expected_fpr="$3"
+  local sig="${file}.asc"
+
+  [[ "${VERIFY_INTEGRATION_GPG}" == "1" ]] || return 0
+  have_cmd gpg || die "VERIFY_INTEGRATION_GPG=1 requires gpg"
+  [[ -n "${expected_fpr}" ]] || die "missing expected GPG fingerprint for $(basename "${file}")"
+
+  local expected status gpg_status
+  expected="$(normalize_fpr "${expected_fpr}")"
+  download "${sig_url}" "${sig}"
+  gpg_status=0
+  status="$(gpg --status-fd 1 --verify "${sig}" "${file}" 2>&1)" || gpg_status=$?
+  printf '%s\n' "${status}"
+
+  [[ "${gpg_status}" == "0" ]] || die "GPG verification failed for $(basename "${file}")"
+
+  if ! awk -v expect="${expected}" '
+    $1 == "[GNUPG:]" && $2 == "VALIDSIG" {
+      if (toupper($3) == expect || toupper($NF) == expect) ok = 1
+    }
+    END { exit ok ? 0 : 1 }
+  ' <<< "${status}"; then
+    die "GPG signature for $(basename "${file}") was not made by expected key ${expected}"
+  fi
+
+  echo "==> gpg signature ok: $(basename "${file}") (expected key ${expected})"
+}
+
+integration_source_needs_extract() {
+  local src="$1"
+  local marker="$2"
+
+  [[ "${INTEGRATION_SOURCE_REFRESH}" == "1" ]] && return 0
+  [[ -d "${src}" && -f "${src}/${marker}" ]] && return 1
+  return 0
 }
 
 extract() {
@@ -490,6 +704,7 @@ stage_pi_musl_runtime_tree() {
     echo "--- rt/lib ---"
     (cd "${rt}/lib" && ls -la) || true
     echo "--- rt/usr/lib (head) ---"
+    # shellcheck disable=SC2012
     (cd "${rt}/usr/lib" && ls -la | head -n 120) || true
   } > "${rt}/MANIFEST.txt"
 
@@ -784,6 +999,9 @@ build_binaries() {
 
   local ldflags=()
   local cxx_ldflags=()
+  local origin_rpath
+  # shellcheck disable=SC2016
+  origin_rpath='$ORIGIN/../lib'
   if [[ "${LINK_MODE}" == "static" ]]; then
     ldflags+=(-static)
     cxx_ldflags+=(-static -static-libgcc -static-libstdc++)
@@ -812,7 +1030,7 @@ build_binaries() {
 
     run_logged "build-dso-catch" tc g++ "${sys[@]}" "${cflags[@]}" \
       "${WORK_DIR}/src/dso_catch.cpp" -o "${WORK_DIR}/bin/dso_catch" \
-      -ldl -Wl,-rpath,'$ORIGIN/../lib'
+      -ldl -Wl,-rpath,"${origin_rpath}"
 
     run_logged "build-libthrow-symlink" bash -c "
       set -e
@@ -822,7 +1040,7 @@ build_binaries() {
 
     run_logged "build-dlopen-threads" tc g++ "${sys[@]}" "${cflags[@]}" \
       "${WORK_DIR}/src/dlopen_threads.cpp" -o "${WORK_DIR}/bin/dlopen_threads" \
-      -ldl -pthread -Wl,-rpath,'$ORIGIN/../lib'
+      -ldl -pthread -Wl,-rpath,"${origin_rpath}"
 
     run_logged "build-libsym-a" tc gcc "${sys[@]}" "${cflags[@]}" -fPIC -shared \
       -Wl,-soname,libsym_a.so \
@@ -834,7 +1052,7 @@ build_binaries() {
 
     run_logged "build-rtld-collision" tc gcc "${sys[@]}" "${cflags[@]}" \
       "${WORK_DIR}/src/rtld_collision.c" -o "${WORK_DIR}/bin/rtld_collision" \
-      -ldl -Wl,-rpath,'$ORIGIN/../lib'
+      -ldl -Wl,-rpath,"${origin_rpath}"
 
     run_logged "build-symlink-sym-a" bash -c "set -e; ln -sf ../lib/libsym_a.so '${WORK_DIR}/bin/libsym_a.so'; ls -l '${WORK_DIR}/bin/libsym_a.so'"
     run_logged "build-symlink-sym-b" bash -c "set -e; ln -sf ../lib/libsym_b.so '${WORK_DIR}/bin/libsym_b.so'; ls -l '${WORK_DIR}/bin/libsym_b.so'"
@@ -1019,17 +1237,19 @@ integration_zlib() {
   integration_prepare
   export_integration_env
 
-  local tb="${TARBALL_DIR}/zlib-${ZLIB_VER}.tarball"
+  local tb="${TARBALL_DIR}/zlib-${ZLIB_VER}.tar.gz"
   local src="${SRC_DIR}/zlib-${ZLIB_VER}"
 
   download_try "${tb}" \
-    "https://zlib.net/zlib-${ZLIB_VER}.tar.xz" \
-    "https://zlib.net/zlib-${ZLIB_VER}.tar.gz" \
+    "${ZLIB_URL}" \
     "https://zlib.net/fossils/zlib-${ZLIB_VER}.tar.gz" \
-    "https://github.com/madler/zlib/releases/download/v${ZLIB_VER}/zlib-${ZLIB_VER}.tar.xz" \
     "https://github.com/madler/zlib/releases/download/v${ZLIB_VER}/zlib-${ZLIB_VER}.tar.gz"
+  verify_sha256 "${tb}" "${ZLIB_SHA256}"
+  verify_gpg_signature "${tb}" "${ZLIB_SIG_URL}" "${ZLIB_GPG_FPR}"
 
-  [[ -d "${src}" && -f "${src}/configure" ]] || extract "${tb}" "${src}"
+  if integration_source_needs_extract "${src}" "configure"; then
+    extract "${tb}" "${src}"
+  fi
 
   run_logged "integration-zlib-configure" bash -c "
     set -e
@@ -1047,7 +1267,11 @@ integration_openssl() {
   local tb="${TARBALL_DIR}/openssl-${OPENSSL_VER}.tar.gz"
   local src="${SRC_DIR}/openssl-${OPENSSL_VER}"
   download "${OPENSSL_URL}" "${tb}"
-  [[ -d "${src}" && -f "${src}/Configure" ]] || extract "${tb}" "${src}"
+  verify_sha256 "${tb}" "${OPENSSL_SHA256}"
+  verify_gpg_signature "${tb}" "${OPENSSL_SIG_URL}" "${OPENSSL_GPG_FPR}"
+  if integration_source_needs_extract "${src}" "Configure"; then
+    extract "${tb}" "${src}"
+  fi
 
   run_logged "integration-openssl-configure" bash -c "
     set -e
@@ -1068,19 +1292,18 @@ integration_curl() {
   local tb="${TARBALL_DIR}/curl-${CURL_VER}.tar.gz"
   local src="${SRC_DIR}/curl-${CURL_VER}"
   download "${CURL_URL}" "${tb}"
-  [[ -d "${src}" && -f "${src}/configure" ]] || extract "${tb}" "${src}"
+  verify_sha256 "${tb}" "${CURL_SHA256}"
+  verify_gpg_signature "${tb}" "${CURL_SIG_URL}" "${CURL_GPG_FPR}"
+  if integration_source_needs_extract "${src}" "configure"; then
+    extract "${tb}" "${src}"
+  fi
 
   local extra_opts=()
   if [[ "${CURL_DISABLE_LIBPSL}" == "1" ]]; then extra_opts+=(--without-libpsl); fi
   if [[ "${CURL_DISABLE_BROTLI}" == "1" ]]; then extra_opts+=(--without-brotli); fi
 
-  local ca_bundle_opt="--with-ca-bundle=/etc/ssl/certs/ca-certificates.crt"
-  local ca_path_opt="--with-ca-path=/etc/ssl/certs"
-  if [[ "${PI_TLS_SELFCONTAINED}" == "1" ]]; then
-    ca_bundle_opt="--with-ca-bundle=${INSTALL_DIR}/ssl/certs/ca-certificates.crt"
-    ca_path_opt="--with-ca-path=${INSTALL_DIR}/ssl/certs"
-  fi
-
+  # Keep target defaults portable; self-contained tests pass explicit staged CA
+  # bundles at runtime instead of baking host cache paths into curl.
   run_logged "integration-curl-configure" bash -c "
     set -e
     cd '${src}'
@@ -1092,8 +1315,8 @@ integration_curl() {
       --with-sysroot='${SYSROOT}' \
       --with-zlib='${INSTALL_DIR}' \
       --with-openssl='${INSTALL_DIR}' \
-      ${ca_bundle_opt} \
-      ${ca_path_opt} \
+      --with-ca-bundle=/etc/ssl/certs/ca-certificates.crt \
+      --with-ca-path=/etc/ssl/certs \
       ${extra_opts[*]} \
       --disable-manual \
       --disable-debug \
@@ -1111,7 +1334,9 @@ _fixup_runpath_for_bin() {
   have_cmd readelf || die "missing readelf"
   have_cmd grep || die "missing grep"
 
-  local wanted_runpath='$ORIGIN/../lib:$ORIGIN/../lib64'
+  local wanted_runpath
+  # shellcheck disable=SC2016
+  wanted_runpath='$ORIGIN/../lib:$ORIGIN/../lib64'
 
   run_logged "${name}" bash -c "
     set -e
@@ -1274,6 +1499,168 @@ postcheck_integration_artifacts() {
   fi
 }
 
+integration_run_on_pi() {
+  detect_link_mode
+  [[ "${LINK_MODE}" == "dynamic" ]] || die "Pi integration run requires LINK_MODE=dynamic"
+  have_cmd ssh || die "missing ssh"
+  have_cmd scp || die "missing scp"
+  have_cmd tar || die "missing tar"
+
+  stage_pi_musl_runtime_tree
+  pack_pi_runtime_tarball
+
+  run_logged "pi-integration-prepare" ssh -p "${PI_SSH_PORT}" "${PI_SSH}" "
+    set -e
+    rm -rf '${PI_INTEGRATION_DIR}'
+    mkdir -p '${PI_INTEGRATION_DIR}'
+  "
+
+  if have_cmd rsync; then
+    run_logged "pi-integration-copy" rsync -a --delete -e "ssh -p ${PI_SSH_PORT}" \
+      "${INSTALL_DIR}/" "${PI_SSH}:${PI_INTEGRATION_DIR}/"
+  else
+    run_logged "pi-integration-copy" bash -c "
+      set -e
+      scp -P '${PI_SSH_PORT}' -r '${INSTALL_DIR}/.' '${PI_SSH}:${PI_INTEGRATION_DIR}/'
+    "
+  fi
+
+  run_logged "pi-integration-copy-runtime" scp -P "${PI_SSH_PORT}" \
+    "${WORK_DIR}/pi-rt.tgz" "${PI_SSH}:${PI_INTEGRATION_DIR}/"
+
+  run_logged "pi-integration-run" ssh -p "${PI_SSH_PORT}" "${PI_SSH}" "
+    set -e
+    cd '${PI_INTEGRATION_DIR}'
+    tar -xzf pi-rt.tgz
+
+    I='${PI_INTEGRATION_DIR}'
+    LOADER=\"\${I}/pi-rt/lib/ld-musl-aarch64.so.1\"
+    LIBPATH=\"\${I}/lib:\${I}/lib64:\${I}/pi-rt/usr/lib:\${I}/pi-rt/lib\"
+    C=\"\${I}/bin/curl\"
+    O=\"\${I}/bin/openssl\"
+
+    test -x \"\${LOADER}\"
+    test -x \"\${C}\"
+    test -x \"\${O}\"
+
+    run() { \"\${LOADER}\" --library-path \"\${LIBPATH}\" \"\$@\"; }
+    list_deps() { \"\${LOADER}\" --library-path \"\${LIBPATH}\" --list \"\$1\" 2>&1 || true; }
+
+    run \"\${O}\" version
+    run \"\${C}\" --version
+
+    echo
+    echo '== openssl RUNPATH/RPATH =='
+    readelf -d \"\${O}\" | grep -E 'RPATH|RUNPATH' || true
+
+    echo
+    echo '== openssl deps =='
+    openssl_deps=\$(list_deps \"\${O}\")
+    printf '%s\n' \"\${openssl_deps}\"
+    ssl_line=\$(printf '%s\n' \"\${openssl_deps}\" | grep -E 'libssl\.so\.3' | head -n1 || true)
+    crypto_line=\$(printf '%s\n' \"\${openssl_deps}\" | grep -E 'libcrypto\.so\.3' | head -n1 || true)
+    case \"\${ssl_line}\" in
+      *\"\${I}/lib\"*) ;;
+      *) echo \"ERROR: staged openssl is not loading staged libssl: \${ssl_line}\"; exit 10 ;;
+    esac
+    case \"\${crypto_line}\" in
+      *\"\${I}/lib\"*) ;;
+      *) echo \"ERROR: staged openssl is not loading staged libcrypto: \${crypto_line}\"; exit 10 ;;
+    esac
+
+    openssl_ver=\$(run \"\${O}\" version)
+    openssl_cmd_ver=\$(printf '%s\n' \"\${openssl_ver}\" | sed -nE 's/^OpenSSL[[:space:]]+([^[:space:]]+).*/\1/p')
+    openssl_lib_ver=\$(printf '%s\n' \"\${openssl_ver}\" | sed -nE 's/.*\\(Library: OpenSSL[[:space:]]+([^[:space:]]+).*/\1/p')
+    if [[ -z \"\${openssl_lib_ver}\" ]]; then openssl_lib_ver=\"\${openssl_cmd_ver}\"; fi
+    echo \"openssl-command-version=\${openssl_cmd_ver}\"
+    echo \"openssl-library-version=\${openssl_lib_ver}\"
+    if [[ -z \"\${openssl_cmd_ver}\" || \"\${openssl_cmd_ver}\" != \"\${openssl_lib_ver}\" ]]; then
+      echo 'ERROR: staged openssl command/library version mismatch'
+      exit 10
+    fi
+
+    echo
+    echo '== curl RUNPATH/RPATH =='
+    readelf -d \"\${C}\" | grep -E 'RPATH|RUNPATH' || true
+
+    echo
+    echo '== curl deps =='
+    curl_deps=\$(list_deps \"\${C}\")
+    printf '%s\n' \"\${curl_deps}\"
+    for so in libcurl.so.4 libssl.so.3 libcrypto.so.3 libz.so.1; do
+      line=\$(printf '%s\n' \"\${curl_deps}\" | grep -E \"\${so}\" | head -n1 || true)
+      case \"\${line}\" in
+        *\"\${I}/lib\"*) ;;
+        *) echo \"ERROR: staged curl is not loading staged \${so}: \${line}\"; exit 10 ;;
+      esac
+    done
+
+    url='${PI_NET_TEST_URL}'
+    hostport=\${url#*://}
+    hostport=\${hostport%%/*}
+    host=\${hostport%%:*}
+    port=\${hostport#*:}
+    if [[ \"\${port}\" == \"\${hostport}\" ]]; then
+      if echo \"\${url}\" | grep -qi '^http://'; then port=80; else port=443; fi
+    fi
+    if [[ -z \"\${host}\" ]]; then host='example.com'; port=443; fi
+
+    if [[ '${PI_NET_TEST}' == '1' ]]; then
+      echo
+      echo '== network test (curl https, default trust store) =='
+      run \"\${C}\" -fsS -I --max-time 15 '${PI_NET_TEST_URL}' >/dev/null
+      echo \"net-ok(default): ${PI_NET_TEST_URL}\"
+
+      echo
+      echo '== trust store assertion (robust) =='
+      out=\$(run \"\${C}\" -vI --max-time 15 '${PI_NET_TEST_URL}' 2>&1)
+      out=\$(printf '%s\n' \"\${out}\" | tr -d '\\r')
+      printf '%s\n' \"\${out}\"
+      cafile=\$(printf '%s\n' \"\${out}\" | sed -nE 's/^[*[:space:]]*CAfile:[[:space:]]*(.*)\$/\1/p' | head -n1)
+      capath=\$(printf '%s\n' \"\${out}\" | sed -nE 's/^[*[:space:]]*CApath:[[:space:]]*(.*)\$/\1/p' | head -n1)
+      echo \"seen CAfile: \${cafile:-'(not reported)'}\"
+      echo \"seen CApath: \${capath:-'(not reported)'}\"
+      if [[ -n \"\${cafile}\" && \"\${cafile}\" != '/etc/ssl/certs/ca-certificates.crt' ]]; then
+        echo 'trust-FAIL(default): CAfile mismatch'
+        exit 8
+      fi
+      if [[ -n \"\${capath}\" && \"\${capath}\" != '/etc/ssl/certs' ]]; then
+        echo 'trust-FAIL(default): CApath mismatch'
+        exit 8
+      fi
+      echo 'trust-ok(default): CAfile/CApath acceptable'
+    fi
+
+    if [[ '${PI_TLS_SELFCONTAINED}' == '1' ]]; then
+      echo
+      echo '== TLS self-contained test (staged CA bundle) =='
+      B=\"\${I}/ssl/certs/ca-certificates.crt\"
+      test -s \"\${B}\"
+      run \"\${C}\" -fsS -I --max-time 15 --cacert \"\${B}\" '${PI_NET_TEST_URL}' >/dev/null
+      echo \"net-ok(selfcontained): ${PI_NET_TEST_URL}\"
+    fi
+
+    if [[ '${STRESS_OPENSSL_TLS}' == '1' ]]; then
+      echo
+      echo '== OpenSSL TLS handshake test =='
+      if echo \"\${url}\" | grep -qi '^https://'; then
+        echo | run \"\${O}\" s_client -connect \"\${host}:\${port}\" -servername \"\${host}\" \
+          -CAfile /etc/ssl/certs/ca-certificates.crt -CApath /etc/ssl/certs \
+          -verify_return_error -brief >/dev/null
+        echo \"openssl-ok(default): \${host}:\${port}\"
+
+        if [[ '${PI_TLS_SELFCONTAINED}' == '1' ]]; then
+          echo | run \"\${O}\" s_client -connect \"\${host}:\${port}\" -servername \"\${host}\" \
+            -CAfile \"\${I}/ssl/certs/ca-certificates.crt\" -verify_return_error -brief >/dev/null
+          echo \"openssl-ok(selfcontained): \${host}:\${port}\"
+        fi
+      fi
+    fi
+  "
+
+  log "INTEGRATION_RUN_ON_PI: PASS"
+}
+
 run_integration_suite() {
   log "INTEGRATION=1: running integration builds (zlib -> openssl -> curl)"
   integration_zlib
@@ -1284,6 +1671,11 @@ run_integration_suite() {
   integration_fixup_openssl_rpath
   postcheck_integration_artifacts
   log "INTEGRATION: PASS"
+
+  if [[ "${INTEGRATION_RUN_ON_PI}" == "1" ]]; then
+    log "INTEGRATION_RUN_ON_PI=1: copying musl integration tree to Pi and running openssl/curl"
+    integration_run_on_pi
+  fi
 }
 
 # ------------------------------ Tiers -----------------------------------------
@@ -1569,6 +1961,7 @@ Key env:
   TC_PREFIX=${TC_PREFIX}
   SYSROOT=${SYSROOT}
   QEMU_AARCH64=${QEMU_AARCH64}
+  FRESH_LOGS=1              (default; clears prior logs/status at start of a run)
 
 Pi env:
   PI_SSH=${PI_SSH}
@@ -1582,6 +1975,15 @@ TLS env:
   CA_BUNDLE_URL=${CA_BUNDLE_URL}
   PI_SYSROOT=${PI_SYSROOT}
   TLS_CA_BUNDLE=/path/to/ca.crt (override CA selection)
+  VERIFY_INTEGRATION_DOWNLOADS=${VERIFY_INTEGRATION_DOWNLOADS}
+  VERIFY_INTEGRATION_GPG=${VERIFY_INTEGRATION_GPG}
+  INTEGRATION_SOURCE_REFRESH=${INTEGRATION_SOURCE_REFRESH}
+  ZLIB_SHA256=${ZLIB_SHA256}
+  ZLIB_GPG_FPR=${ZLIB_GPG_FPR}
+  OPENSSL_SHA256=${OPENSSL_SHA256}
+  OPENSSL_GPG_FPR=${OPENSSL_GPG_FPR}
+  CURL_SHA256=${CURL_SHA256}
+  CURL_GPG_FPR=${CURL_GPG_FPR}
 
 A+ stress env:
   STRESS_CPP=${STRESS_CPP}
@@ -1594,15 +1996,14 @@ EOF
 
 main() {
   echo "Version: ${SCRIPT_VERSION}"
-  need_paths
 
   local cmd="${1:-}"
   case "${cmd}" in
-    report)  tier_report ;;
-    sanity)  tier_sanity ;;
-    smoke)   tier_smoke ;;
-    nightly) tier_nightly ;;
-    all)     tier_all ;;
+    report)  validate_settings; reset_logs_for_run; tier_report ;;
+    sanity)  validate_settings; reset_logs_for_run; tier_sanity ;;
+    smoke)   validate_settings; reset_logs_for_run; tier_smoke ;;
+    nightly) validate_settings; reset_logs_for_run; tier_nightly ;;
+    all)     validate_settings; reset_logs_for_run; tier_all ;;
     ""|help|-h|--help) usage ;;
     *) die "unknown command: ${cmd}" ;;
   esac

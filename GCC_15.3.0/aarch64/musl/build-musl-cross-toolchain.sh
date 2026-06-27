@@ -29,12 +29,31 @@ TARGET_TUNE="${TARGET_TUNE:-cortex-a72}"
 ENABLE_DYNAMIC="${ENABLE_DYNAMIC:-1}"                 # 1 => build shared+static (recommended), 0 => static-only
 INSTALL_RUNTIME_TO_SYSROOT="${INSTALL_RUNTIME_TO_SYSROOT:-1}"  # 1 => copy libstdc++.so, libgcc_s.so, etc into sysroot
 
+# Production linker/tool defaults. Keep zstd configurable because older host
+# distros may not have the development libraries installed.
+BINUTILS_ZSTD="${BINUTILS_ZSTD:-auto}"
+GCC_ZSTD="${GCC_ZSTD:-auto}"
+DEFAULT_HASH_STYLE="${DEFAULT_HASH_STYLE:-gnu}"
+MANIFEST_FILE="${MANIFEST_FILE:-${PREFIX}/toolchain-manifest.txt}"
+
+# Optional source authenticity check. Enable after importing and trusting the
+# expected upstream release keys in your local GnuPG keyring.
+VERIFY_GPG="${VERIFY_GPG:-1}"
+
+# Expected upstream source-signing primary fingerprints. GPG trust is still a
+# local policy decision, but these assertions prevent accepting the wrong key.
+GCC_GPG_PRIMARY_FPR="${GCC_GPG_PRIMARY_FPR:-13975A70E63C361C73AE69EF6EEB81F8981C74C7}"
+BINUTILS_GPG_PRIMARY_FPR="${BINUTILS_GPG_PRIMARY_FPR:-5EF3A41171BB77E6110ED2D01F3D03348DB1A3E2}"
+MUSL_GPG_PRIMARY_FPR="${MUSL_GPG_PRIMARY_FPR:-836489290BB6B70F99FFDA0556BCDB593020450F}"
+
 # Layout
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_ROOT="${SRC_ROOT:-${ROOT_DIR}/src}"
 TARBALL_DIR="${TARBALL_DIR:-${ROOT_DIR}/tarballs}"
 BUILD_DIR="${BUILD_DIR:-${ROOT_DIR}/build}"
 LOG_DIR="${LOG_DIR:-${ROOT_DIR}/logs}"
+FRESH_LOGS="${FRESH_LOGS:-1}"
+SOURCE_REFRESH="${SOURCE_REFRESH:-1}"
 
 # Parallelism
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
@@ -55,6 +74,7 @@ PREFIX_CLEANED=0
 # GCC
 GCC_TARBALL="${GCC_TARBALL:-gcc-${GCC_VER}.tar.xz}"
 GCC_URL="${GCC_URL:-https://ftp.gnu.org/gnu/gcc/gcc-${GCC_VER}/${GCC_TARBALL}}"
+GCC_SIG_URL="${GCC_SIG_URL:-${GCC_URL}.sig}"
 GCC_SHA256="${GCC_SHA256:-fa59c1beef8995f27c4d71c1df227587189315d3e6faff1bb4306e61b0c530eb}"
 GCC_SRC_DIR="${GCC_SRC_DIR:-${SRC_ROOT}/gcc-${GCC_VER}}"
 
@@ -62,6 +82,7 @@ GCC_SRC_DIR="${GCC_SRC_DIR:-${SRC_ROOT}/gcc-${GCC_VER}}"
 BINUTILS_VER="${BINUTILS_VER:-2.46.1}"
 BINUTILS_TARBALL="${BINUTILS_TARBALL:-binutils-${BINUTILS_VER}.tar.xz}"
 BINUTILS_URL="${BINUTILS_URL:-https://ftp.gnu.org/gnu/binutils/${BINUTILS_TARBALL}}"
+BINUTILS_SIG_URL="${BINUTILS_SIG_URL:-${BINUTILS_URL}.sig}"
 BINUTILS_SHA256="${BINUTILS_SHA256:-e127a709cba24c76de8936cb7083dd768f28cd37eb010492e2f19b71eb1294e4}"
 BINUTILS_SRC_DIR="${BINUTILS_SRC_DIR:-${SRC_ROOT}/binutils-${BINUTILS_VER}}"
 BINUTILS_BUILD_DIR="${BINUTILS_BUILD_DIR:-${BUILD_DIR}/binutils}"
@@ -78,6 +99,7 @@ LINUX_BUILD_DIR="${LINUX_BUILD_DIR:-${BUILD_DIR}/linux-headers}"
 MUSL_VER="${MUSL_VER:-1.2.6}"
 MUSL_TARBALL="${MUSL_TARBALL:-musl-${MUSL_VER}.tar.gz}"
 MUSL_URL="${MUSL_URL:-https://musl.libc.org/releases/${MUSL_TARBALL}}"
+MUSL_SIG_URL="${MUSL_SIG_URL:-${MUSL_URL}.asc}"
 MUSL_SHA256="${MUSL_SHA256:-d585fd3b613c66151fc3249e8ed44f77020cb5e6c1e635a616d3f9f82460512a}"
 MUSL_SRC_DIR="${MUSL_SRC_DIR:-${SRC_ROOT}/musl-${MUSL_VER}}"
 MUSL_BUILD_DIR="${MUSL_BUILD_DIR:-${BUILD_DIR}/musl}"
@@ -107,6 +129,13 @@ log_step() {
   ( "$@" ) > >(tee -a "${log}") 2> >(tee -a "${log}" 1>&2)
 }
 
+reset_logs_for_run() {
+  [[ "${FRESH_LOGS}" == "1" ]] || return 0
+
+  mkdirp "${LOG_DIR}"
+  rm -f "${LOG_DIR}"/*.log
+}
+
 clean_prefix_once() {
   [[ "${CLEAN_PREFIX}" == "1" ]] || return 0
   [[ "${PREFIX_CLEANED}" == "0" ]] || return 0
@@ -114,6 +143,57 @@ clean_prefix_once() {
   echo "WARNING: CLEAN_PREFIX=1, removing ${PREFIX}" >&2
   rm -rf "${PREFIX}"
   PREFIX_CLEANED=1
+}
+
+validate_settings() {
+  [[ -n "${TARGET}" ]] || die "TARGET must not be empty"
+  [[ -n "${PREFIX}" && "${PREFIX}" != "/" ]] || die "refusing dangerous PREFIX='${PREFIX}'"
+  [[ -n "${SYSROOT}" && "${SYSROOT}" != "/" ]] || die "refusing dangerous SYSROOT='${SYSROOT}'"
+
+  case "${FRESH_LOGS}" in
+    0|1) ;;
+    *) die "FRESH_LOGS must be 0 or 1" ;;
+  esac
+  case "${SOURCE_REFRESH}" in
+    0|1) ;;
+    *) die "SOURCE_REFRESH must be 0 or 1" ;;
+  esac
+  case "${RECONFIGURE}" in
+    0|1) ;;
+    *) die "RECONFIGURE must be 0 or 1" ;;
+  esac
+  case "${VERIFY_GPG}" in
+    0|1) ;;
+    *) die "VERIFY_GPG must be 0 or 1" ;;
+  esac
+  case "${CLEAN_PREFIX}" in
+    0|1) ;;
+    *) die "CLEAN_PREFIX must be 0 or 1" ;;
+  esac
+  case "${ENABLE_DYNAMIC}" in
+    0|1) ;;
+    *) die "ENABLE_DYNAMIC must be 0 or 1" ;;
+  esac
+  case "${INSTALL_RUNTIME_TO_SYSROOT}" in
+    0|1) ;;
+    *) die "INSTALL_RUNTIME_TO_SYSROOT must be 0 or 1" ;;
+  esac
+  case "${DEFAULT_HASH_STYLE}" in
+    sysv|gnu|both) ;;
+    *) die "DEFAULT_HASH_STYLE must be sysv, gnu, or both" ;;
+  esac
+  case "${BINUTILS_ZSTD}" in
+    auto|yes|no) ;;
+    *) die "BINUTILS_ZSTD must be auto, yes, or no" ;;
+  esac
+  case "${GCC_ZSTD}" in
+    auto|yes|system|no|/*) ;;
+    *) die "GCC_ZSTD must be auto, yes/system, no, or an absolute prefix path" ;;
+  esac
+
+  if [[ "${SOURCE_REFRESH}" == "1" && "${RECONFIGURE}" == "0" ]]; then
+    die "SOURCE_REFRESH=1 requires RECONFIGURE=1 so build directories cannot point at stale source trees"
+  fi
 }
 
 # ------------------------------ Download / Verify / Extract -------------------
@@ -151,6 +231,41 @@ verify_sha256() {
   echo "==> sha256 ok: $(basename "$file")"
 }
 
+normalize_fpr() {
+  tr '[:lower:]' '[:upper:]' <<< "${1//[[:space:]]/}"
+}
+
+verify_gpg_signature() {
+  local file="$1"
+  local sig_url="$2"
+  local expected_fpr="$3"
+  local sig="${file}.sig"
+
+  [[ "${VERIFY_GPG}" == "1" ]] || return 0
+  have_cmd gpg || die "VERIFY_GPG=1 requires gpg"
+
+  download_file "${sig_url}" "${sig}"
+
+  local status expected gpg_status
+  expected="$(normalize_fpr "${expected_fpr}")"
+  gpg_status=0
+  status="$(gpg --status-fd 1 --verify "${sig}" "${file}" 2>&1)" || gpg_status=$?
+  printf '%s\n' "${status}"
+
+  [[ "${gpg_status}" == "0" ]] || die "GPG verification failed for $(basename "$file")"
+
+  if ! awk -v expect="${expected}" '
+    $1 == "[GNUPG:]" && $2 == "VALIDSIG" {
+      if (toupper($3) == expect || toupper($NF) == expect) ok = 1
+    }
+    END { exit ok ? 0 : 1 }
+  ' <<< "${status}"; then
+    die "GPG signature for $(basename "$file") was not made by expected key ${expected}"
+  fi
+
+  echo "==> gpg signature ok: $(basename "$file") (expected key ${expected})"
+}
+
 extract_tarball() {
   local tarball="$1"
   local dest="$2"
@@ -178,16 +293,24 @@ extract_tarball() {
   [[ -f "$dest/configure" ]] || die "extract result missing configure: $dest"
 }
 
+refresh_source_tree() {
+  local dest="$1"
+
+  [[ "${SOURCE_REFRESH}" == "1" ]] || return 0
+  if [[ -d "${dest}" ]]; then
+    echo "==> source refresh: removing existing ${dest}"
+    rm -rf "${dest}"
+  fi
+}
+
 ensure_gcc_source() {
   mkdirp "${SRC_ROOT}" "${TARBALL_DIR}"
-  if [[ -d "${GCC_SRC_DIR}" && -f "${GCC_SRC_DIR}/configure" ]]; then
-    :
-  else
-    local tb="${TARBALL_DIR}/${GCC_TARBALL}"
-    download_file "${GCC_URL}" "${tb}"
-    verify_sha256 "${tb}" "${GCC_SHA256}"
-    extract_tarball "${tb}" "${GCC_SRC_DIR}"
-  fi
+  local tb="${TARBALL_DIR}/${GCC_TARBALL}"
+  download_file "${GCC_URL}" "${tb}"
+  verify_sha256 "${tb}" "${GCC_SHA256}"
+  verify_gpg_signature "${tb}" "${GCC_SIG_URL}" "${GCC_GPG_PRIMARY_FPR}"
+  refresh_source_tree "${GCC_SRC_DIR}"
+  extract_tarball "${tb}" "${GCC_SRC_DIR}"
 
   if [[ ! -f "${GCC_SRC_DIR}/gmp/README" ]]; then
     echo "==> gcc: fetching prerequisites (gmp/mpfr/mpc/isl)"
@@ -197,23 +320,24 @@ ensure_gcc_source() {
 
 ensure_binutils_source() {
   mkdirp "${SRC_ROOT}" "${TARBALL_DIR}"
-  if [[ -d "${BINUTILS_SRC_DIR}" && -f "${BINUTILS_SRC_DIR}/configure" ]]; then
-    return 0
-  fi
   local tb="${TARBALL_DIR}/${BINUTILS_TARBALL}"
   download_file "${BINUTILS_URL}" "${tb}"
   verify_sha256 "${tb}" "${BINUTILS_SHA256}"
+  verify_gpg_signature "${tb}" "${BINUTILS_SIG_URL}" "${BINUTILS_GPG_PRIMARY_FPR}"
+  refresh_source_tree "${BINUTILS_SRC_DIR}"
   extract_tarball "${tb}" "${BINUTILS_SRC_DIR}"
 }
 
 ensure_linux_source() {
   mkdirp "${SRC_ROOT}" "${TARBALL_DIR}"
-  if [[ -d "${LINUX_SRC_DIR}" && -f "${LINUX_SRC_DIR}/Makefile" ]]; then
-    return 0
-  fi
   local tb="${TARBALL_DIR}/${LINUX_TARBALL}"
   download_file "${LINUX_URL}" "${tb}"
   verify_sha256 "${tb}" "${LINUX_SHA256}"
+  refresh_source_tree "${LINUX_SRC_DIR}"
+  if [[ -d "${LINUX_SRC_DIR}" && -f "${LINUX_SRC_DIR}/Makefile" ]]; then
+    echo "==> extract: already extracted: ${LINUX_SRC_DIR}"
+    return 0
+  fi
   echo "==> extract: $tb -> ${LINUX_SRC_DIR}"
   rm -rf "${LINUX_SRC_DIR}"
   mkdirp "$(dirname "${LINUX_SRC_DIR}")"
@@ -223,14 +347,12 @@ ensure_linux_source() {
 
 ensure_musl_source() {
   mkdirp "${SRC_ROOT}" "${TARBALL_DIR}"
-  if [[ -d "${MUSL_SRC_DIR}" && -f "${MUSL_SRC_DIR}/configure" ]]; then
-    :
-  else
-    local tb="${TARBALL_DIR}/${MUSL_TARBALL}"
-    download_file "${MUSL_URL}" "${tb}"
-    verify_sha256 "${tb}" "${MUSL_SHA256}"
-    extract_tarball "${tb}" "${MUSL_SRC_DIR}"
-  fi
+  local tb="${TARBALL_DIR}/${MUSL_TARBALL}"
+  download_file "${MUSL_URL}" "${tb}"
+  verify_sha256 "${tb}" "${MUSL_SHA256}"
+  verify_gpg_signature "${tb}" "${MUSL_SIG_URL}" "${MUSL_GPG_PRIMARY_FPR}"
+  refresh_source_tree "${MUSL_SRC_DIR}"
+  extract_tarball "${tb}" "${MUSL_SRC_DIR}"
 
   local marker="${MUSL_SRC_DIR}/.patched-${MUSL_ICONV_PATCH_COMMIT}"
   if [[ ! -f "${marker}" ]]; then
@@ -290,6 +412,146 @@ require_host_build_tools() {
   have_cmd g++  || die "missing host g++"
 }
 
+gcc_zstd_configure_arg() {
+  case "${GCC_ZSTD}" in
+    auto) echo "" ;;
+    yes|system) echo "--with-zstd" ;;
+    no) echo "--without-zstd" ;;
+    *) echo "--with-zstd=${GCC_ZSTD}" ;;
+  esac
+}
+
+verify_gpg_key_available() {
+  local label="$1"
+  local fpr="$2"
+  local normalized
+  normalized="$(normalize_fpr "${fpr}")"
+
+  if gpg --list-keys "${normalized}" >/dev/null 2>&1; then
+    printf '  ok   %-8s %s\n' "${label}" "${normalized}"
+  else
+    printf '  MISS %-8s %s\n' "${label}" "${normalized}"
+    return 1
+  fi
+}
+
+verify_host() {
+  export_basic_env
+  validate_settings
+
+  local required=(
+    bash
+    make
+    gcc
+    g++
+    tar
+    xz
+    find
+    awk
+    sed
+    grep
+    sha256sum
+    strings
+    patch
+  )
+  local recommended=(
+    curl
+    wget
+    bison
+    flex
+    makeinfo
+    rsync
+    gpg
+    pkg-config
+    qemu-aarch64
+    patchelf
+    ssh
+    scp
+  )
+
+  local missing=0 cmd
+  echo "==> host required tools"
+  for cmd in "${required[@]}"; do
+    if have_cmd "${cmd}"; then
+      printf '  ok   %s -> %s\n' "${cmd}" "$(command -v "${cmd}")"
+    else
+      printf '  MISS %s\n' "${cmd}"
+      missing=1
+    fi
+  done
+
+  if ! have_cmd curl && ! have_cmd wget; then
+    echo "  MISS curl or wget (one is required for downloads)"
+    missing=1
+  fi
+  if [[ "${VERIFY_GPG}" == "1" ]] && ! have_cmd gpg; then
+    echo "  MISS gpg (required because VERIFY_GPG=1)"
+    missing=1
+  fi
+
+  if [[ "${VERIFY_GPG}" == "1" ]] && have_cmd gpg; then
+    echo
+    echo "==> source-signing keys"
+    verify_gpg_key_available "gcc" "${GCC_GPG_PRIMARY_FPR}" || missing=1
+    verify_gpg_key_available "binutils" "${BINUTILS_GPG_PRIMARY_FPR}" || missing=1
+    verify_gpg_key_available "musl" "${MUSL_GPG_PRIMARY_FPR}" || missing=1
+  fi
+
+  echo
+  echo "==> host recommended tools"
+  for cmd in "${recommended[@]}"; do
+    if have_cmd "${cmd}"; then
+      printf '  ok   %s -> %s\n' "${cmd}" "$(command -v "${cmd}")"
+    else
+      printf '  WARN %s not found\n' "${cmd}"
+    fi
+  done
+
+  echo
+  echo "==> host development headers"
+  if printf '#include <zlib.h>\nint main(void){return 0;}\n' | gcc -x c - -lz -o /tmp/musl-toolchain-zlib-check.$$ >/dev/null 2>&1; then
+    echo "  ok   zlib headers/library"
+    rm -f /tmp/musl-toolchain-zlib-check.$$
+  else
+    echo "  MISS zlib headers/library (needed for --with-system-zlib)"
+    missing=1
+  fi
+
+  if printf '#include <zstd.h>\nint main(void){return 0;}\n' | gcc -x c - -lzstd -o /tmp/musl-toolchain-zstd-check.$$ >/dev/null 2>&1; then
+    echo "  ok   zstd headers/library"
+    rm -f /tmp/musl-toolchain-zstd-check.$$
+  else
+    echo "  WARN zstd headers/library not found; zstd support may be disabled or configure may fail if forced"
+  fi
+
+  echo
+  echo "==> host summary"
+  echo "  TARGET=${TARGET}"
+  echo "  PREFIX=${PREFIX}"
+  echo "  SYSROOT=${SYSROOT}"
+  echo "  ENABLE_DYNAMIC=${ENABLE_DYNAMIC}"
+  echo "  INSTALL_RUNTIME_TO_SYSROOT=${INSTALL_RUNTIME_TO_SYSROOT}"
+  echo "  FRESH_LOGS=${FRESH_LOGS}"
+  echo "  SOURCE_REFRESH=${SOURCE_REFRESH}"
+  echo "  VERIFY_GPG=${VERIFY_GPG}"
+  echo "  BUILD_TRIPLET=${BUILD_TRIPLET:-$(build_triplet)}"
+
+  [[ "${missing}" == "0" ]] || die "host verification failed"
+  echo "==> verify-host: PASS"
+}
+
+build_triplet() {
+  if have_cmd gcc; then
+    gcc -dumpmachine
+  elif [[ -x "${BINUTILS_SRC_DIR}/config.guess" ]]; then
+    "${BINUTILS_SRC_DIR}/config.guess"
+  elif [[ -x "${GCC_SRC_DIR}/config.guess" ]]; then
+    "${GCC_SRC_DIR}/config.guess"
+  else
+    die "cannot determine build triplet; install host gcc or set BUILD_TRIPLET"
+  fi
+}
+
 require_binutils_in_prefix() {
   [[ -x "${PREFIX}/bin/${TARGET}-as" ]] || die "missing ${PREFIX}/bin/${TARGET}-as (binutils not installed or prefix cleaned)"
   [[ -x "${PREFIX}/bin/${TARGET}-ld" ]] || die "missing ${PREFIX}/bin/${TARGET}-ld (binutils not installed or prefix cleaned)"
@@ -315,6 +577,88 @@ require_musl_loader_present() {
   [[ -e "${SYSROOT}/lib/${loader}" ]] || die "sysroot missing musl dynamic loader: ${SYSROOT}/lib/${loader}"
 }
 
+musl_version_from_sysroot() {
+  local libc
+  libc="$(find "${SYSROOT}" -type f -name 'libc.so' -print -quit 2>/dev/null || true)"
+  if [[ -n "${libc}" ]]; then
+    strings "${libc}" 2>/dev/null | grep -E '^Version [0-9]+([.][0-9]+)+' | head -n 1 || true
+  fi
+}
+
+write_manifest() {
+  export_basic_env
+  mkdirp "$(dirname "${MANIFEST_FILE}")"
+
+  local build host loader shared_flags gcc_zstd_arg with_as with_ld
+  build="${BUILD_TRIPLET:-$(build_triplet)}"
+  host="${HOST_TRIPLET:-${build}}"
+  loader="$(musl_loader_name)"
+  gcc_zstd_arg="$(gcc_zstd_configure_arg)"
+  with_as=""
+  with_ld=""
+  if [[ -x "${PREFIX}/bin/${TARGET}-as" ]]; then
+    with_as="--with-as=${PREFIX}/bin/${TARGET}-as"
+  fi
+  if [[ -x "${PREFIX}/bin/${TARGET}-ld" ]]; then
+    with_ld="--with-ld=${PREFIX}/bin/${TARGET}-ld"
+  fi
+  shared_flags="--disable-shared"
+  if [[ "${ENABLE_DYNAMIC}" == "1" ]]; then
+    shared_flags="--enable-shared --enable-static"
+  fi
+
+  {
+    echo "toolchain_manifest_version=1"
+    echo "script_version=${SCRIPT_VERSION}"
+    echo "generated_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "target=${TARGET}"
+    echo "build_triplet=${build}"
+    echo "host_triplet=${host}"
+    echo "prefix=${PREFIX}"
+    echo "sysroot=${SYSROOT}"
+    echo "gcc_version=${GCC_VER}"
+    echo "gcc_tarball=${GCC_TARBALL}"
+    echo "gcc_sha256=${GCC_SHA256}"
+    echo "binutils_version=${BINUTILS_VER}"
+    echo "binutils_tarball=${BINUTILS_TARBALL}"
+    echo "binutils_sha256=${BINUTILS_SHA256}"
+    echo "linux_version=${LINUX_VER}"
+    echo "linux_tarball=${LINUX_TARBALL}"
+    echo "linux_sha256=${LINUX_SHA256}"
+    echo "musl_version=${MUSL_VER}"
+    echo "musl_tarball=${MUSL_TARBALL}"
+    echo "musl_sha256=${MUSL_SHA256}"
+    echo "musl_patch_commit=${MUSL_ICONV_PATCH_COMMIT}"
+    echo "musl_patch_sha256=${MUSL_ICONV_PATCH_SHA256}"
+    echo "target_arch_base=${TARGET_ARCH_BASE}"
+    echo "target_tune=${TARGET_TUNE}"
+    echo "enable_dynamic=${ENABLE_DYNAMIC}"
+    echo "install_runtime_to_sysroot=${INSTALL_RUNTIME_TO_SYSROOT}"
+    echo "default_hash_style=${DEFAULT_HASH_STYLE}"
+    echo "binutils_zstd=${BINUTILS_ZSTD}"
+    echo "gcc_zstd=${GCC_ZSTD}"
+    echo "gcc_zstd_configure_arg=${gcc_zstd_arg:-omitted-auto}"
+    echo "gcc_with_as=${with_as:-auto}"
+    echo "gcc_with_ld=${with_ld:-auto}"
+    echo "musl_loader=${SYSROOT}/lib/${loader}"
+    echo "libc_version=$(musl_version_from_sysroot)"
+    echo
+    echo "[configure.binutils]"
+    echo "--build=${build} --host=${host} --target=${TARGET} --prefix=${PREFIX} --with-sysroot=${SYSROOT} --disable-multilib --disable-werror --disable-nls --enable-plugins --enable-lto --enable-ld=default --enable-relro --enable-default-hash-style=${DEFAULT_HASH_STYLE} --with-zstd=${BINUTILS_ZSTD} --with-system-zlib"
+    echo
+    echo "[configure.gcc.stage1]"
+    echo "--build=${build} --host=${host} --target=${TARGET} --prefix=${PREFIX} --with-sysroot=${SYSROOT} --with-build-sysroot=${SYSROOT} --disable-multilib --disable-nls --disable-bootstrap --disable-werror --enable-languages=c --without-headers --with-newlib --disable-shared --disable-threads --disable-libatomic --disable-libgomp --disable-libquadmath --disable-libssp --disable-libvtv --disable-libstdcxx --enable-checking=release --with-system-zlib --with-arch=${TARGET_ARCH_BASE} --with-tune=${TARGET_TUNE}"
+    echo
+    echo "[configure.musl]"
+    echo "--target=${TARGET} --prefix=/usr --syslibdir=/lib"
+    echo
+    echo "[configure.gcc.final]"
+    echo "--build=${build} --host=${host} --target=${TARGET} --prefix=${PREFIX} --with-sysroot=${SYSROOT} --with-build-sysroot=${SYSROOT} --with-native-system-header-dir=/usr/include --disable-multilib --disable-nls --disable-bootstrap --disable-werror --enable-languages=c,c++ ${shared_flags} --enable-threads=posix --enable-linker-build-id --enable-plugin --enable-lto --with-system-zlib ${gcc_zstd_arg} --without-included-gettext --enable-checking=release --with-arch=${TARGET_ARCH_BASE} --with-tune=${TARGET_TUNE} --enable-default-pie --enable-default-ssp ${with_as} ${with_ld}"
+  } > "${MANIFEST_FILE}"
+
+  echo "==> manifest written: ${MANIFEST_FILE}"
+}
+
 # ----------------------------- Build: binutils --------------------------------
 build_binutils() {
   export_basic_env
@@ -324,9 +668,15 @@ build_binutils() {
   clean_prefix_once
   mkdirp "${BINUTILS_BUILD_DIR}"
 
+  local build host
+  build="${BUILD_TRIPLET:-$(build_triplet)}"
+  host="${HOST_TRIPLET:-${build}}"
+
   log_step "configure-binutils" bash -c "
     cd '${BINUTILS_BUILD_DIR}'
     '${BINUTILS_SRC_DIR}/configure' \
+      --build='${build}' \
+      --host='${host}' \
       --target='${TARGET}' \
       --prefix='${PREFIX}' \
       --with-sysroot='${SYSROOT}' \
@@ -336,6 +686,9 @@ build_binutils() {
       --enable-plugins \
       --enable-lto \
       --enable-ld=default \
+      --enable-relro \
+      --enable-default-hash-style='${DEFAULT_HASH_STYLE}' \
+      --with-zstd='${BINUTILS_ZSTD}' \
       --with-system-zlib
   "
 
@@ -385,9 +738,15 @@ build_gcc_stage1() {
   fi
   mkdirp "${gcc_build}"
 
+  local build host
+  build="${BUILD_TRIPLET:-$(build_triplet)}"
+  host="${HOST_TRIPLET:-${build}}"
+
   log_step "configure-gcc-stage1" bash -c "
     cd '${gcc_build}'
     '${GCC_SRC_DIR}/configure' \
+      --build='${build}' \
+      --host='${host}' \
       --target='${TARGET}' \
       --prefix='${PREFIX}' \
       --with-sysroot='${SYSROOT}' \
@@ -559,12 +918,14 @@ build_gcc_final() {
 
   local with_as=""
   local with_ld=""
+  local with_zstd=""
   if [[ -x "${PREFIX}/bin/${TARGET}-as" ]]; then
     with_as="--with-as=${PREFIX}/bin/${TARGET}-as"
   fi
   if [[ -x "${PREFIX}/bin/${TARGET}-ld" ]]; then
     with_ld="--with-ld=${PREFIX}/bin/${TARGET}-ld"
   fi
+  with_zstd="$(gcc_zstd_configure_arg)"
 
   # Dynamic-capable fix:
   # - If ENABLE_DYNAMIC=1, build shared runtimes (libstdc++.so, libgcc_s.so, etc) AND static ones.
@@ -574,9 +935,15 @@ build_gcc_final() {
     shared_flags="--enable-shared --enable-static"
   fi
 
+  local build host
+  build="${BUILD_TRIPLET:-$(build_triplet)}"
+  host="${HOST_TRIPLET:-${build}}"
+
   log_step "configure-gcc-final" bash -c "
     cd '${gcc_build}'
     '${GCC_SRC_DIR}/configure' \
+      --build='${build}' \
+      --host='${host}' \
       --target='${TARGET}' \
       --prefix='${PREFIX}' \
       --with-sysroot='${SYSROOT}' \
@@ -593,10 +960,13 @@ build_gcc_final() {
       --enable-plugin \
       --enable-lto \
       --with-system-zlib \
+      ${with_zstd} \
       --without-included-gettext \
       --enable-checking=release \
       --with-arch='${TARGET_ARCH_BASE}' \
       --with-tune='${TARGET_TUNE}' \
+      --enable-default-pie \
+      --enable-default-ssp \
       ${with_as} ${with_ld}
   "
 
@@ -618,6 +988,7 @@ build_gcc_final() {
   echo "==> GCC final installed to ${PREFIX}"
   echo "==> SYSROOT: ${SYSROOT}"
   echo "==> ENABLE_DYNAMIC=${ENABLE_DYNAMIC} (shared runtimes: $([[ "${ENABLE_DYNAMIC}" == "1" ]] && echo enabled || echo disabled))"
+  write_manifest
 }
 
 build_all() {
@@ -634,6 +1005,7 @@ usage() {
 Usage: $0 <command>
 
 Commands:
+  verify-host  Check host tools, libraries, GPG/download tools, and settings
   fetch-hashes Download source archives and print candidate SHA256 values
   binutils   Download/extract (if needed) + build+install cross binutils into PREFIX
   headers    Download/extract (if needed) + install linux headers into SYSROOT
@@ -645,10 +1017,22 @@ Commands:
 Env toggles:
   CLEAN_PREFIX=1               Remove PREFIX before install (dangerous, now only once per run)
   RECONFIGURE=0                Reuse existing build dirs (not recommended)
+  FRESH_LOGS=1                 Clear build logs at the start of build commands (default: 1)
+  SOURCE_REFRESH=1             Re-extract verified source archives before building (default: 1)
   ENABLE_DYNAMIC=1|0           Build shared+static (1, default) or static-only (0)
   INSTALL_RUNTIME_TO_SYSROOT=1 Copy libstdc++.so/libgcc_s.so/etc into sysroot (default: 1)
   TARGET_ARCH_BASE=            Default arch for GCC (default: armv8-a)
   TARGET_TUNE=                 Default tune for GCC (default: cortex-a72)
+  BINUTILS_ZSTD=               zstd support mode for binutils (default: auto)
+  GCC_ZSTD=                    GCC zstd mode: auto, yes/system, no, or prefix path (default: auto)
+  DEFAULT_HASH_STYLE=          GNU ld default hash style (default: gnu)
+  MANIFEST_FILE=               Build manifest output (default: ${MANIFEST_FILE})
+  VERIFY_GPG=                  Verify GNU/musl source signatures with trusted GPG keys (default: ${VERIFY_GPG})
+  GCC_GPG_PRIMARY_FPR=         Expected GCC signing primary fingerprint
+  BINUTILS_GPG_PRIMARY_FPR=    Expected binutils signing primary fingerprint
+  MUSL_GPG_PRIMARY_FPR=        Expected musl signing primary fingerprint
+  BUILD_TRIPLET=               Override detected build triplet
+  HOST_TRIPLET=                Override host triplet for generated tools
 
 Key vars:
   TARGET=${TARGET}
@@ -667,13 +1051,14 @@ main() {
   echo "Version: $SCRIPT_VERSION"
   local cmd="${1:-}"
   case "${cmd}" in
+    verify-host) verify_host ;;
     fetch-hashes) print_source_hashes ;;
-    binutils) build_binutils ;;
-    headers)  install_linux_headers ;;
-    stage1)   build_gcc_stage1 ;;
-    musl)     build_musl ;;
-    gcc)      build_gcc_final ;;
-    build)    build_all ;;
+    binutils) validate_settings; reset_logs_for_run; build_binutils ;;
+    headers)  validate_settings; reset_logs_for_run; install_linux_headers ;;
+    stage1)   validate_settings; reset_logs_for_run; build_gcc_stage1 ;;
+    musl)     validate_settings; reset_logs_for_run; build_musl ;;
+    gcc)      validate_settings; reset_logs_for_run; build_gcc_final ;;
+    build)    validate_settings; reset_logs_for_run; build_all ;;
     ""|help|-h|--help) usage ;;
     *) die "unknown command: ${cmd}" ;;
   esac
