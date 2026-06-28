@@ -234,6 +234,74 @@ reset_logs_for_run() {
   rm -rf "${LOG_DIR}/.status"
 }
 
+cleanup_remove_path() {
+  local label="$1"
+  local path="$2"
+  local path_abs root_abs prefix_abs sysroot_abs
+
+  [[ -n "${path}" ]] || die "cleanup ${label} path must not be empty"
+  have_cmd realpath || die "clean/distclean requires realpath"
+
+  path_abs="$(realpath -m "${path}")"
+  root_abs="$(realpath -m "$(pwd)")"
+  prefix_abs="$(realpath -m "${TC_PREFIX}")"
+  sysroot_abs="$(realpath -m "${SYSROOT}")"
+
+  [[ "${path_abs}" != "/" ]] || die "refusing to clean ${label}: resolved to /"
+  [[ "${path_abs}" != "${root_abs}" ]] || die "refusing to clean ${label}: resolved to current directory (${root_abs})"
+
+  case "${path_abs}" in
+    "${root_abs}"/*) ;;
+    *) die "refusing to clean ${label}: ${path_abs} is outside current directory (${root_abs})" ;;
+  esac
+
+  case "${path_abs}" in
+    "${prefix_abs}"|"${prefix_abs}"/*)
+      die "refusing to clean ${label}: ${path_abs} is inside TC_PREFIX (${prefix_abs})"
+      ;;
+  esac
+  case "${prefix_abs}" in
+    "${path_abs}"/*)
+      die "refusing to clean ${label}: ${path_abs} contains TC_PREFIX (${prefix_abs})"
+      ;;
+  esac
+  case "${path_abs}" in
+    "${sysroot_abs}"|"${sysroot_abs}"/*)
+      die "refusing to clean ${label}: ${path_abs} is inside SYSROOT (${sysroot_abs})"
+      ;;
+  esac
+  case "${sysroot_abs}" in
+    "${path_abs}"/*)
+      die "refusing to clean ${label}: ${path_abs} contains SYSROOT (${sysroot_abs})"
+      ;;
+  esac
+
+  if [[ -e "${path_abs}" ]]; then
+    log "clean: removing ${label}: ${path_abs}"
+    rm -rf -- "${path_abs}"
+  else
+    log "clean: already clean ${label}: ${path_abs}"
+  fi
+}
+
+clean_test_artifacts() {
+  log "clean: preserving installed toolchain TC_PREFIX: ${TC_PREFIX}"
+  log "clean: preserving SYSROOT: ${SYSROOT}"
+
+  cleanup_remove_path "test work directory" "${WORK_DIR}"
+  cleanup_remove_path "test log directory" "${LOG_DIR}"
+}
+
+distclean_test_artifacts() {
+  clean_test_artifacts
+
+  cleanup_remove_path "integration tarball directory" "${TARBALL_DIR}"
+  cleanup_remove_path "integration source directory" "${SRC_DIR}"
+  cleanup_remove_path "integration build directory" "${BUILD_DIR}"
+  cleanup_remove_path "integration install directory" "${INSTALL_DIR}"
+  cleanup_remove_path "test cache directory" "${CACHE_DIR}"
+}
+
 run_logged() {
   local name="$1"; shift
   local logf="${LOG_DIR}/${name}.log"
@@ -1495,6 +1563,8 @@ Usage:
   $0 nightly
   $0 all
   $0 fetch-integration-hashes
+  $0 clean
+  $0 distclean
 
 One-liner A+ run:
   A_PLUS=1 $0 nightly
@@ -1505,6 +1575,8 @@ Key env (common):
   SYSROOT=${SYSROOT}
   QEMU_AARCH64=${QEMU_AARCH64}
   FRESH_LOGS=1              (default; clears prior logs/status at start of a run)
+  clean                     removes LOG_DIR and WORK_DIR
+  distclean                 removes LOG_DIR, WORK_DIR, and integration CACHE_DIR
 
 Nightly (runs on Pi):
   PI_SSH=${PI_SSH}
@@ -1550,6 +1622,8 @@ main() {
     smoke)   reset_logs_for_run; tier_smoke ;;
     nightly) reset_logs_for_run; tier_nightly ;;
     all)     reset_logs_for_run; tier_all ;;
+    clean)   clean_test_artifacts ;;
+    distclean) distclean_test_artifacts ;;
     ""|help|-h|--help) usage ;;
     *) die "unknown command: ${cmd}" ;;
   esac
