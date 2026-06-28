@@ -145,10 +145,14 @@ clean_prefix_once() {
   PREFIX_CLEANED=1
 }
 
-validate_settings() {
+validate_core_settings() {
   [[ -n "${TARGET}" ]] || die "TARGET must not be empty"
   [[ -n "${PREFIX}" && "${PREFIX}" != "/" ]] || die "refusing dangerous PREFIX='${PREFIX}'"
   [[ -n "${SYSROOT}" && "${SYSROOT}" != "/" ]] || die "refusing dangerous SYSROOT='${SYSROOT}'"
+}
+
+validate_settings() {
+  validate_core_settings
 
   case "${FRESH_LOGS}" in
     0|1) ;;
@@ -194,6 +198,69 @@ validate_settings() {
   if [[ "${SOURCE_REFRESH}" == "1" && "${RECONFIGURE}" == "0" ]]; then
     die "SOURCE_REFRESH=1 requires RECONFIGURE=1 so build directories cannot point at stale source trees"
   fi
+}
+
+distclean_remove_path() {
+  local label="$1"
+  local path="$2"
+  local path_abs root_abs prefix_abs sysroot_abs
+
+  [[ -n "${path}" ]] || die "distclean ${label} path must not be empty"
+  have_cmd realpath || die "distclean requires realpath"
+
+  path_abs="$(realpath -m "${path}")"
+  root_abs="$(realpath -m "${ROOT_DIR}")"
+  prefix_abs="$(realpath -m "${PREFIX}")"
+  sysroot_abs="$(realpath -m "${SYSROOT}")"
+
+  [[ "${path_abs}" != "/" ]] || die "refusing to distclean ${label}: resolved to /"
+  [[ "${path_abs}" != "${root_abs}" ]] || die "refusing to distclean ${label}: resolved to ROOT_DIR (${root_abs})"
+
+  case "${path_abs}" in
+    "${root_abs}"/*) ;;
+    *) die "refusing to distclean ${label}: ${path_abs} is outside ROOT_DIR (${root_abs})" ;;
+  esac
+
+  case "${path_abs}" in
+    "${prefix_abs}"|"${prefix_abs}"/*)
+      die "refusing to distclean ${label}: ${path_abs} is inside PREFIX (${prefix_abs})"
+      ;;
+  esac
+  case "${prefix_abs}" in
+    "${path_abs}"/*)
+      die "refusing to distclean ${label}: ${path_abs} contains PREFIX (${prefix_abs})"
+      ;;
+  esac
+  case "${path_abs}" in
+    "${sysroot_abs}"|"${sysroot_abs}"/*)
+      die "refusing to distclean ${label}: ${path_abs} is inside SYSROOT (${sysroot_abs})"
+      ;;
+  esac
+  case "${sysroot_abs}" in
+    "${path_abs}"/*)
+      die "refusing to distclean ${label}: ${path_abs} contains SYSROOT (${sysroot_abs})"
+      ;;
+  esac
+
+  if [[ -e "${path_abs}" ]]; then
+    echo "==> distclean: removing ${label}: ${path_abs}"
+    rm -rf -- "${path_abs}"
+  else
+    echo "==> distclean: already clean ${label}: ${path_abs}"
+  fi
+}
+
+distclean() {
+  validate_core_settings
+
+  echo "==> distclean: preserving installed toolchain PREFIX: ${PREFIX}"
+  echo "==> distclean: preserving SYSROOT under PREFIX: ${SYSROOT}"
+
+  distclean_remove_path "build directory" "${BUILD_DIR}"
+  distclean_remove_path "source directory" "${SRC_ROOT}"
+  distclean_remove_path "tarball directory" "${TARBALL_DIR}"
+  distclean_remove_path "build log directory" "${LOG_DIR}"
+  distclean_remove_path "build GPG cache" "${ROOT_DIR}/.gnupg-build-verify"
 }
 
 # ------------------------------ Download / Verify / Extract -------------------
@@ -447,6 +514,7 @@ verify_host() {
     tar
     xz
     find
+    realpath
     awk
     sed
     grep
@@ -1013,6 +1081,7 @@ Commands:
   musl       Build+install musl into SYSROOT (requires headers + stage1)
   gcc        Build+install final GCC (C,C++) into PREFIX (requires musl)
   build      Build binutils + headers + stage1 + musl + gcc
+  distclean  Remove workspace build artifacts, sources, tarballs, logs, and build GPG cache; keep PREFIX
 
 Env toggles:
   CLEAN_PREFIX=1               Remove PREFIX before install (dangerous, now only once per run)
@@ -1059,6 +1128,7 @@ main() {
     musl)     validate_settings; reset_logs_for_run; build_musl ;;
     gcc)      validate_settings; reset_logs_for_run; build_gcc_final ;;
     build)    validate_settings; reset_logs_for_run; build_all ;;
+    distclean) distclean ;;
     ""|help|-h|--help) usage ;;
     *) die "unknown command: ${cmd}" ;;
   esac
