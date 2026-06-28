@@ -89,7 +89,7 @@ The default install writes:
 /opt/gcc-15.3.0-musl-cross/aarch64-linux-musl/sysroot
 ```
 
-After a successful build, remove workspace-only build artifacts while keeping
+After a successful build, remove build-only workspace artifacts while keeping
 the installed `/opt` toolchain available:
 
 ```sh
@@ -99,6 +99,19 @@ the installed `/opt` toolchain available:
 This removes this directory's generated build tree, extracted sources,
 downloaded tarballs, build logs, and `.gnupg-build-verify` cache. It refuses to
 remove the install prefix or sysroot.
+
+Validation artifacts are owned by the test script. Remove only transient test
+logs/work files:
+
+```sh
+./test-musl-cross-toolchain.sh clean
+```
+
+Remove all validation artifacts, including cached integration sources/builds:
+
+```sh
+./test-musl-cross-toolchain.sh distclean
+```
 
 ## Strongest Validation
 
