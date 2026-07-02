@@ -25,6 +25,7 @@ TARGET="${TARGET:-aarch64-linux-musl}"
 GCC_VER="${GCC_VER:-15.3.0}"
 TC_PREFIX="${TC_PREFIX:-/opt/gcc-${GCC_VER}-musl-cross}"
 SYSROOT="${SYSROOT:-${TC_PREFIX}/${TARGET}/sysroot}"
+TOOLCHAIN_MANIFEST="${TOOLCHAIN_MANIFEST:-${TC_PREFIX}/toolchain-manifest.txt}"
 
 # LINK_MODE:
 #   auto    -> detect based on sysroot contents (static-first)
@@ -206,11 +207,17 @@ musl_version_from_sysroot() {
   fi
 }
 
+manifest_value() {
+  local key="$1"
+  [[ -f "${TOOLCHAIN_MANIFEST}" ]] || return 1
+  awk -F= -v key="${key}" '$1 == key { sub(/^[^=]*=/, ""); print; found=1; exit } END { exit !found }' "${TOOLCHAIN_MANIFEST}"
+}
+
 write_validation_report() {
   local report="${LOG_DIR}/validation-report.txt"
   local sdir="${LOG_DIR}/.status"
   local musl_version=""
-  musl_version="$(musl_version_from_sysroot 2>/dev/null || true)"
+  musl_version="$(manifest_value musl_version 2>/dev/null || musl_version_from_sysroot 2>/dev/null || true)"
 
   mkdirp "${LOG_DIR}"
   {
@@ -223,6 +230,8 @@ write_validation_report() {
     echo "tc_prefix=${TC_PREFIX}"
     echo "sysroot=${SYSROOT}"
     echo "link_mode=${LINK_MODE}"
+    echo "libc_name=musl"
+    echo "libc_version=${musl_version}"
     echo "musl_version=${musl_version}"
     if [[ -x "${TC_PREFIX}/bin/${TARGET}-gcc" ]]; then
       echo "gcc_version=$("${TC_PREFIX}/bin/${TARGET}-gcc" -dumpfullversion -dumpversion 2>/dev/null || true)"

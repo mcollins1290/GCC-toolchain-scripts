@@ -646,14 +646,6 @@ require_musl_loader_present() {
   [[ -e "${SYSROOT}/lib/${loader}" ]] || die "sysroot missing musl dynamic loader: ${SYSROOT}/lib/${loader}"
 }
 
-musl_version_from_sysroot() {
-  local libc
-  libc="$(find "${SYSROOT}" -type f -name 'libc.so' -print -quit 2>/dev/null || true)"
-  if [[ -n "${libc}" ]]; then
-    strings "${libc}" 2>/dev/null | grep -E '^Version [0-9]+([.][0-9]+)+' | head -n 1 || true
-  fi
-}
-
 write_manifest() {
   export_basic_env
   mkdirp "$(dirname "${MANIFEST_FILE}")"
@@ -711,7 +703,8 @@ write_manifest() {
     echo "gcc_with_as=${with_as:-auto}"
     echo "gcc_with_ld=${with_ld:-auto}"
     echo "musl_loader=${SYSROOT}/lib/${loader}"
-    echo "libc_version=$(musl_version_from_sysroot)"
+    echo "libc_name=musl"
+    echo "libc_version=${MUSL_VER}"
     echo
     echo "[configure.binutils]"
     echo "--build=${build} --host=${host} --target=${TARGET} --prefix=${PREFIX} --with-sysroot=${SYSROOT} --disable-multilib --disable-werror --disable-nls --enable-plugins --enable-lto --enable-ld=default --enable-relro --enable-default-hash-style=${DEFAULT_HASH_STYLE} --with-zstd=${BINUTILS_ZSTD} --with-system-zlib"
