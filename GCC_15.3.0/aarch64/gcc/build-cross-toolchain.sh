@@ -28,6 +28,7 @@ TARGET_TUNE="${TARGET_TUNE:-cortex-a72}"
 BINUTILS_ZSTD="${BINUTILS_ZSTD:-auto}"
 GCC_ZSTD="${GCC_ZSTD:-auto}"
 DEFAULT_HASH_STYLE="${DEFAULT_HASH_STYLE:-gnu}"
+GCC_PKGVERSION="${GCC_PKGVERSION:-GCC ${GCC_VER} Raspberry Pi 4B cross toolchain}"
 
 # Optional production packaging mode: copy the input sysroot into PREFIX and
 # configure the compiler against that installed copy.
@@ -515,13 +516,14 @@ write_manifest() {
     echo "default_hash_style=${DEFAULT_HASH_STYLE}"
     echo "binutils_zstd=${BINUTILS_ZSTD}"
     echo "gcc_zstd=${GCC_ZSTD}"
+    echo "gcc_pkgversion=${GCC_PKGVERSION}"
     echo "libc_version=$(libc_version_from_sysroot)"
     echo
     echo "[configure.binutils]"
     echo "--build=${build} --host=${host} --target=${TARGET} --prefix=${PREFIX} --with-sysroot=${effective} --disable-multilib --disable-werror --disable-nls --enable-plugins --enable-lto --enable-ld=default --enable-relro --enable-default-hash-style=${DEFAULT_HASH_STYLE} --with-zstd=${BINUTILS_ZSTD} --with-system-zlib"
     echo
     echo "[configure.gcc]"
-    echo "--build=${build} --host=${host} --target=${TARGET} --prefix=${PREFIX} --with-sysroot=${effective} --with-build-sysroot=${effective} --with-native-system-header-dir=/usr/include --enable-multiarch --disable-multilib --enable-languages=c,c++ --enable-shared --enable-threads=posix --enable-linker-build-id --enable-plugin --enable-lto --with-system-zlib --with-arch=${TARGET_ARCH_BASE} --with-tune=${TARGET_TUNE} --disable-bootstrap --enable-default-pie --enable-default-ssp"
+    echo "--build=${build} --host=${host} --target=${TARGET} --prefix=${PREFIX} --with-sysroot=${effective} --with-build-sysroot=${effective} --with-native-system-header-dir=/usr/include --enable-multiarch --disable-multilib --enable-languages=c,c++ --enable-shared --enable-threads=posix --enable-linker-build-id --enable-plugin --enable-lto --with-system-zlib --with-arch=${TARGET_ARCH_BASE} --with-tune=${TARGET_TUNE} --disable-bootstrap --enable-host-pie --enable-host-bind-now --enable-default-pie --enable-default-ssp --with-pkgversion='${GCC_PKGVERSION}'"
   } > "${MANIFEST_FILE}"
 
   echo "==> manifest written: ${MANIFEST_FILE}"
@@ -654,8 +656,11 @@ build_toolchain() {
       --with-arch='${TARGET_ARCH_BASE}' \
       --with-tune='${TARGET_TUNE}' \
       --disable-bootstrap \
+      --enable-host-pie \
+      --enable-host-bind-now \
       --enable-default-pie \
       --enable-default-ssp \
+      --with-pkgversion='${GCC_PKGVERSION}' \
       ${with_as} ${with_ld}
   "
 
@@ -700,6 +705,7 @@ Env toggles:
   BINUTILS_ZSTD=      zstd support mode for binutils (default: auto)
   GCC_ZSTD=           GCC zstd mode: auto, yes/system, no, or prefix path (default: auto)
   DEFAULT_HASH_STYLE= GNU ld default hash style (default: gnu)
+  GCC_PKGVERSION=     GCC package identity string (default: ${GCC_PKGVERSION})
   INSTALL_SYSROOT=    Copy SYSROOT into PREFIX/${INSTALLED_SYSROOT_REL} (default: ${INSTALL_SYSROOT})
   INSTALLED_SYSROOT_REL= Relative installed sysroot path (default: ${TARGET}/sysroot)
   MANIFEST_FILE=      Build manifest output (default: ${MANIFEST_FILE})
