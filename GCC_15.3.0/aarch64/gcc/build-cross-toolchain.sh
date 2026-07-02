@@ -489,10 +489,25 @@ write_manifest() {
   export_basic_env
   mkdirp "$(dirname "${MANIFEST_FILE}")"
 
-  local effective build host
+  local effective build host gcc_zstd_arg with_as with_ld
   effective="$(effective_sysroot)"
   build="${BUILD_TRIPLET:-$(build_triplet)}"
   host="${HOST_TRIPLET:-${build}}"
+  gcc_zstd_arg=""
+  with_as=""
+  with_ld=""
+  case "${GCC_ZSTD}" in
+    auto) gcc_zstd_arg="" ;;
+    yes|system) gcc_zstd_arg="--with-zstd" ;;
+    no) gcc_zstd_arg="--without-zstd" ;;
+    *) gcc_zstd_arg="--with-zstd=${GCC_ZSTD}" ;;
+  esac
+  if [[ -x "${PREFIX}/bin/${TARGET}-as" ]]; then
+    with_as="--with-as=${PREFIX}/bin/${TARGET}-as"
+  fi
+  if [[ -x "${PREFIX}/bin/${TARGET}-ld" ]]; then
+    with_ld="--with-ld=${PREFIX}/bin/${TARGET}-ld"
+  fi
 
   {
     echo "toolchain_manifest_version=1"
@@ -516,14 +531,17 @@ write_manifest() {
     echo "default_hash_style=${DEFAULT_HASH_STYLE}"
     echo "binutils_zstd=${BINUTILS_ZSTD}"
     echo "gcc_zstd=${GCC_ZSTD}"
+    echo "gcc_zstd_configure_arg=${gcc_zstd_arg:-omitted-auto}"
     echo "gcc_pkgversion=${GCC_PKGVERSION}"
+    echo "gcc_with_as=${with_as:-auto}"
+    echo "gcc_with_ld=${with_ld:-auto}"
     echo "libc_version=$(libc_version_from_sysroot)"
     echo
     echo "[configure.binutils]"
     echo "--build=${build} --host=${host} --target=${TARGET} --prefix=${PREFIX} --with-sysroot=${effective} --disable-multilib --disable-werror --disable-nls --enable-plugins --enable-lto --enable-ld=default --enable-relro --enable-default-hash-style=${DEFAULT_HASH_STYLE} --with-zstd=${BINUTILS_ZSTD} --with-system-zlib"
     echo
     echo "[configure.gcc]"
-    echo "--build=${build} --host=${host} --target=${TARGET} --prefix=${PREFIX} --with-sysroot=${effective} --with-build-sysroot=${effective} --with-native-system-header-dir=/usr/include --enable-multiarch --disable-multilib --enable-languages=c,c++ --enable-shared --enable-threads=posix --enable-linker-build-id --enable-plugin --enable-lto --with-system-zlib --with-arch=${TARGET_ARCH_BASE} --with-tune=${TARGET_TUNE} --disable-bootstrap --enable-host-pie --enable-host-bind-now --enable-default-pie --enable-default-ssp --with-pkgversion='${GCC_PKGVERSION}'"
+    echo "--build=${build} --host=${host} --target=${TARGET} --prefix=${PREFIX} --with-sysroot=${effective} --with-build-sysroot=${effective} --with-native-system-header-dir=/usr/include --enable-multiarch --disable-multilib --enable-languages=c,c++ --enable-shared --enable-threads=posix --enable-linker-build-id --enable-plugin --enable-lto --with-system-zlib ${gcc_zstd_arg} --without-included-gettext --enable-checking=release --disable-werror --with-arch=${TARGET_ARCH_BASE} --with-tune=${TARGET_TUNE} --disable-bootstrap --enable-host-pie --enable-host-bind-now --enable-default-pie --enable-default-ssp --with-pkgversion='${GCC_PKGVERSION}' ${with_as} ${with_ld}"
   } > "${MANIFEST_FILE}"
 
   echo "==> manifest written: ${MANIFEST_FILE}"
