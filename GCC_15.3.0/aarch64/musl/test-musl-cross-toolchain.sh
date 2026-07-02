@@ -104,8 +104,12 @@ BUILD_DIR="${BUILD_DIR:-${CACHE_DIR}/build}"
 INSTALL_DIR="${INSTALL_DIR:-${CACHE_DIR}/install/${TARGET}}"
 
 KEEP_WORKDIR="${KEEP_WORKDIR:-0}"
-KEEP_CACHE="${KEEP_CACHE:-1}"
+KEEP_CACHE="${KEEP_CACHE:-0}"
+KEEP_REMOTE="${KEEP_REMOTE:-0}"
 FRESH_LOGS="${FRESH_LOGS:-1}"
+EXIT_CLEANUP_ENABLED=0
+REMOTE_TMPDIR_USED=0
+REMOTE_INTEGRATION_USED=0
 
 # ------------------------------ A+ Super Suite Switch --------------------------
 A_PLUS="${A_PLUS:-0}"
@@ -245,6 +249,9 @@ write_validation_report() {
     echo "integration_run_on_pi=${INTEGRATION_RUN_ON_PI}"
     echo "pi_net_test=${PI_NET_TEST}"
     echo "pi_tls_selfcontained=${PI_TLS_SELFCONTAINED}"
+    echo "keep_workdir=${KEEP_WORKDIR}"
+    echo "keep_cache=${KEEP_CACHE}"
+    echo "keep_remote=${KEEP_REMOTE}"
     echo "verify_integration_downloads=${VERIFY_INTEGRATION_DOWNLOADS}"
     echo "verify_integration_gpg=${VERIFY_INTEGRATION_GPG}"
     echo "integration_source_refresh=${INTEGRATION_SOURCE_REFRESH}"
@@ -400,6 +407,63 @@ distclean_test_artifacts() {
   cleanup_remove_path "test cache directory" "${CACHE_DIR}"
 }
 
+check_remote_artifact_path() {
+  local path="$2"
+
+  [[ -n "${path}" ]] || return 1
+  [[ "${path}" == /* ]] || return 1
+  [[ "${path}" != "/" ]] || return 1
+
+  case "${path}" in
+    *"'"*|*$'\n'*|*$'\r'*)
+      return 1
+      ;;
+  esac
+
+  case "${path}" in
+    /tmp/*|/var/tmp/*) ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_remote_artifact_path() {
+  local label="$1"
+  local path="$2"
+
+  if ! check_remote_artifact_path "${label}" "${path}"; then
+    die "${label} must be an absolute /tmp or /var/tmp child path without quotes/newlines: ${path}"
+  fi
+}
+
+remote_reset_dir() {
+  local label="$1"
+  local path="$2"
+
+  validate_remote_artifact_path "${label}" "${path}"
+  ssh -p "${PI_SSH_PORT}" "${PI_SSH}" "
+    set -e
+    rm -rf -- '${path}'
+    mkdir -p '${path}'
+  "
+}
+
+remote_cleanup_dir() {
+  local label="$1"
+  local path="$2"
+
+  [[ "${KEEP_REMOTE}" == "0" ]] || return 0
+  have_cmd ssh || return 0
+
+  if ! check_remote_artifact_path "${label}" "${path}"; then
+    echo "WARNING: skipping unsafe remote cleanup for ${label}: ${path}" >&2
+    return 0
+  fi
+
+  log "remote-clean: removing ${label}: ${PI_SSH}:${path}"
+  ssh -p "${PI_SSH_PORT}" "${PI_SSH}" "rm -rf -- '${path}'" >/dev/null 2>&1 || \
+    echo "WARNING: remote cleanup failed for ${label}: ${PI_SSH}:${path}" >&2
+}
+
 run_logged() {
   local name="$1"; shift
   local logf="${LOG_DIR}/${name}.log"
@@ -410,6 +474,15 @@ run_logged() {
 }
 
 cleanup() {
+  [[ "${EXIT_CLEANUP_ENABLED}" == "1" ]] || return 0
+
+  if [[ "${REMOTE_INTEGRATION_USED}" == "1" ]]; then
+    remote_cleanup_dir "Pi integration directory" "${PI_INTEGRATION_DIR}"
+  fi
+  if [[ "${REMOTE_TMPDIR_USED}" == "1" ]]; then
+    remote_cleanup_dir "Pi test directory" "${PI_TMPDIR}"
+  fi
+
   if [[ "${KEEP_WORKDIR}" == "1" ]]; then
     log "KEEP_WORKDIR=1 leaving work dir: ${WORK_DIR}"
   else
@@ -1577,11 +1650,8 @@ integration_run_on_pi() {
   stage_pi_musl_runtime_tree
   pack_pi_runtime_tarball
 
-  run_logged "pi-integration-prepare" ssh -p "${PI_SSH_PORT}" "${PI_SSH}" "
-    set -e
-    rm -rf '${PI_INTEGRATION_DIR}'
-    mkdir -p '${PI_INTEGRATION_DIR}'
-  "
+  REMOTE_INTEGRATION_USED=1
+  run_logged "pi-integration-prepare" remote_reset_dir "PI_INTEGRATION_DIR" "${PI_INTEGRATION_DIR}"
 
   if have_cmd rsync; then
     run_logged "pi-integration-copy" rsync -a --delete -e "ssh -p ${PI_SSH_PORT}" \
@@ -1802,6 +1872,7 @@ tier_report() {
 }
 
 tier_sanity() {
+  EXIT_CLEANUP_ENABLED=1
   mark_tier_start "sanity"
   need_paths
   need_qemu
@@ -1836,6 +1907,7 @@ tier_sanity() {
 }
 
 tier_smoke() {
+  EXIT_CLEANUP_ENABLED=1
   mark_tier_start "smoke"
   need_paths
   need_qemu
@@ -1899,6 +1971,7 @@ tier_smoke() {
 }
 
 tier_nightly() {
+  EXIT_CLEANUP_ENABLED=1
   mark_tier_start "nightly"
   need_paths
   mkdirp "${WORK_DIR}"
@@ -1916,7 +1989,8 @@ tier_nightly() {
   have_cmd scp || die "missing scp"
   have_cmd tar || die "missing tar"
 
-  run_logged "pi-prepare" ssh -p "${PI_SSH_PORT}" "${PI_SSH}" "mkdir -p '${PI_TMPDIR}' && rm -rf '${PI_TMPDIR}'/*"
+  REMOTE_TMPDIR_USED=1
+  run_logged "pi-prepare" remote_reset_dir "PI_TMPDIR" "${PI_TMPDIR}"
 
   run_logged "pi-copy-bins" bash -c "
     set -e
@@ -2032,6 +2106,8 @@ Key env:
   SYSROOT=${SYSROOT}
   QEMU_AARCH64=${QEMU_AARCH64}
   FRESH_LOGS=1              (default; clears prior logs/status at start of a run)
+  KEEP_WORKDIR=${KEEP_WORKDIR}              (default: 0; removes transient host work dir on exit)
+  KEEP_CACHE=${KEEP_CACHE}                (default: 0; removes integration cache on exit)
   clean                     removes LOG_DIR and WORK_DIR
   distclean                 removes LOG_DIR, WORK_DIR, and integration CACHE_DIR
 
@@ -2039,6 +2115,7 @@ Pi env:
   PI_SSH=${PI_SSH}
   PI_SSH_PORT=${PI_SSH_PORT}
   PI_TMPDIR=${PI_TMPDIR}
+  KEEP_REMOTE=${KEEP_REMOTE}               (default: 0; removes Pi test/integration dirs on exit)
 
 TLS env:
   PI_NET_TEST=${PI_NET_TEST}
