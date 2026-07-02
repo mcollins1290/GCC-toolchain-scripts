@@ -7,7 +7,7 @@ Pinned build inputs:
 
 - GCC 15.3.0
 - GNU binutils 2.46.1
-- Linux headers 6.18.36
+- Linux headers 6.18.37
 - musl 1.2.6 plus pinned CVE-2026-6042 iconv patch
 - zlib 1.3.2 for integration validation
 - OpenSSL 3.5.7 for integration validation
