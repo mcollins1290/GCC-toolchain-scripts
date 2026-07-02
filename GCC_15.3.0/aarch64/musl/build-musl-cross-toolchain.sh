@@ -34,6 +34,7 @@ INSTALL_RUNTIME_TO_SYSROOT="${INSTALL_RUNTIME_TO_SYSROOT:-1}"  # 1 => copy libst
 BINUTILS_ZSTD="${BINUTILS_ZSTD:-auto}"
 GCC_ZSTD="${GCC_ZSTD:-auto}"
 DEFAULT_HASH_STYLE="${DEFAULT_HASH_STYLE:-gnu}"
+GCC_PKGVERSION="${GCC_PKGVERSION:-GCC ${GCC_VER} Raspberry Pi 4B musl cross toolchain}"
 MANIFEST_FILE="${MANIFEST_FILE:-${PREFIX}/toolchain-manifest.txt}"
 
 # Optional source authenticity check. Enable after importing and trusting the
@@ -706,6 +707,7 @@ write_manifest() {
     echo "binutils_zstd=${BINUTILS_ZSTD}"
     echo "gcc_zstd=${GCC_ZSTD}"
     echo "gcc_zstd_configure_arg=${gcc_zstd_arg:-omitted-auto}"
+    echo "gcc_pkgversion=${GCC_PKGVERSION}"
     echo "gcc_with_as=${with_as:-auto}"
     echo "gcc_with_ld=${with_ld:-auto}"
     echo "musl_loader=${SYSROOT}/lib/${loader}"
@@ -715,13 +717,13 @@ write_manifest() {
     echo "--build=${build} --host=${host} --target=${TARGET} --prefix=${PREFIX} --with-sysroot=${SYSROOT} --disable-multilib --disable-werror --disable-nls --enable-plugins --enable-lto --enable-ld=default --enable-relro --enable-default-hash-style=${DEFAULT_HASH_STYLE} --with-zstd=${BINUTILS_ZSTD} --with-system-zlib"
     echo
     echo "[configure.gcc.stage1]"
-    echo "--build=${build} --host=${host} --target=${TARGET} --prefix=${PREFIX} --with-sysroot=${SYSROOT} --with-build-sysroot=${SYSROOT} --disable-multilib --disable-nls --disable-bootstrap --disable-werror --enable-languages=c --without-headers --with-newlib --disable-shared --disable-threads --disable-libatomic --disable-libgomp --disable-libquadmath --disable-libssp --disable-libvtv --disable-libstdcxx --enable-checking=release --with-system-zlib --with-arch=${TARGET_ARCH_BASE} --with-tune=${TARGET_TUNE}"
+    echo "--build=${build} --host=${host} --target=${TARGET} --prefix=${PREFIX} --with-sysroot=${SYSROOT} --with-build-sysroot=${SYSROOT} --disable-multilib --disable-nls --disable-bootstrap --disable-werror --enable-languages=c --without-headers --with-newlib --disable-shared --disable-threads --disable-libatomic --disable-libgomp --disable-libquadmath --disable-libssp --disable-libvtv --disable-libstdcxx --enable-checking=release --with-system-zlib --with-arch=${TARGET_ARCH_BASE} --with-tune=${TARGET_TUNE} --enable-host-pie --enable-host-bind-now --with-pkgversion='${GCC_PKGVERSION}'"
     echo
     echo "[configure.musl]"
     echo "--target=${TARGET} --prefix=/usr --syslibdir=/lib"
     echo
     echo "[configure.gcc.final]"
-    echo "--build=${build} --host=${host} --target=${TARGET} --prefix=${PREFIX} --with-sysroot=${SYSROOT} --with-build-sysroot=${SYSROOT} --with-native-system-header-dir=/usr/include --disable-multilib --disable-nls --disable-bootstrap --disable-werror --enable-languages=c,c++ ${shared_flags} --enable-threads=posix --enable-linker-build-id --enable-plugin --enable-lto --with-system-zlib ${gcc_zstd_arg} --without-included-gettext --enable-checking=release --with-arch=${TARGET_ARCH_BASE} --with-tune=${TARGET_TUNE} --enable-default-pie --enable-default-ssp ${with_as} ${with_ld}"
+    echo "--build=${build} --host=${host} --target=${TARGET} --prefix=${PREFIX} --with-sysroot=${SYSROOT} --with-build-sysroot=${SYSROOT} --with-native-system-header-dir=/usr/include --disable-multilib --disable-nls --disable-bootstrap --disable-werror --enable-languages=c,c++ ${shared_flags} --enable-threads=posix --enable-linker-build-id --enable-plugin --enable-lto --with-system-zlib ${gcc_zstd_arg} --without-included-gettext --enable-checking=release --with-arch=${TARGET_ARCH_BASE} --with-tune=${TARGET_TUNE} --enable-host-pie --enable-host-bind-now --enable-default-pie --enable-default-ssp --with-pkgversion='${GCC_PKGVERSION}' ${with_as} ${with_ld}"
   } > "${MANIFEST_FILE}"
 
   echo "==> manifest written: ${MANIFEST_FILE}"
@@ -837,7 +839,10 @@ build_gcc_stage1() {
       --enable-checking=release \
       --with-system-zlib \
       --with-arch='${TARGET_ARCH_BASE}' \
-      --with-tune='${TARGET_TUNE}'
+      --with-tune='${TARGET_TUNE}' \
+      --enable-host-pie \
+      --enable-host-bind-now \
+      --with-pkgversion='${GCC_PKGVERSION}'
   "
 
   log_step "build-gcc-stage1" bash -c "
@@ -1033,8 +1038,11 @@ build_gcc_final() {
       --enable-checking=release \
       --with-arch='${TARGET_ARCH_BASE}' \
       --with-tune='${TARGET_TUNE}' \
+      --enable-host-pie \
+      --enable-host-bind-now \
       --enable-default-pie \
       --enable-default-ssp \
+      --with-pkgversion='${GCC_PKGVERSION}' \
       ${with_as} ${with_ld}
   "
 
@@ -1095,6 +1103,7 @@ Env toggles:
   BINUTILS_ZSTD=               zstd support mode for binutils (default: auto)
   GCC_ZSTD=                    GCC zstd mode: auto, yes/system, no, or prefix path (default: auto)
   DEFAULT_HASH_STYLE=          GNU ld default hash style (default: gnu)
+  GCC_PKGVERSION=              GCC package identity string (default: ${GCC_PKGVERSION})
   MANIFEST_FILE=               Build manifest output (default: ${MANIFEST_FILE})
   VERIFY_GPG=                  Verify GNU/musl source signatures with trusted GPG keys (default: ${VERIFY_GPG})
   GCC_GPG_PRIMARY_FPR=         Expected GCC signing primary fingerprint
