@@ -646,6 +646,33 @@ require_musl_loader_present() {
   [[ -e "${SYSROOT}/lib/${loader}" ]] || die "sysroot missing musl dynamic loader: ${SYSROOT}/lib/${loader}"
 }
 
+install_pkg_config_wrapper() {
+  local wrapper
+  wrapper="${PREFIX}/bin/${TARGET}-pkg-config"
+
+  mkdirp "$(dirname "${wrapper}")"
+  cat > "${wrapper}" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+sysroot="\${TARGET_PKG_CONFIG_SYSROOT_DIR:-${SYSROOT}}"
+pkg_config_bin="\${PKG_CONFIG_BIN:-pkg-config}"
+
+export PKG_CONFIG_SYSROOT_DIR="\${sysroot}"
+export PKG_CONFIG_LIBDIR="\${sysroot}/usr/lib/pkgconfig:\${sysroot}/lib/pkgconfig:\${sysroot}/usr/share/pkgconfig"
+
+if [[ -n "\${TARGET_PKG_CONFIG_PATH:-}" ]]; then
+  export PKG_CONFIG_PATH="\${TARGET_PKG_CONFIG_PATH}"
+else
+  unset PKG_CONFIG_PATH
+fi
+
+exec "\${pkg_config_bin}" "\$@"
+EOF
+  chmod 0755 "${wrapper}"
+  echo "==> installed pkg-config wrapper: ${wrapper}"
+}
+
 write_manifest() {
   export_basic_env
   mkdirp "$(dirname "${MANIFEST_FILE}")"
@@ -705,6 +732,7 @@ write_manifest() {
     echo "musl_loader=${SYSROOT}/lib/${loader}"
     echo "libc_name=musl"
     echo "libc_version=${MUSL_VER}"
+    echo "pkg_config_wrapper=${PREFIX}/bin/${TARGET}-pkg-config"
     echo
     echo "[configure.binutils]"
     echo "--build=${build} --host=${host} --target=${TARGET} --prefix=${PREFIX} --with-sysroot=${SYSROOT} --disable-multilib --disable-werror --disable-nls --enable-plugins --enable-lto --enable-ld=default --enable-relro --enable-default-hash-style=${DEFAULT_HASH_STYLE} --with-zstd=${BINUTILS_ZSTD} --with-system-zlib"
@@ -1053,6 +1081,8 @@ build_gcc_final() {
     install_runtime_libs_to_sysroot
   fi
 
+  install_pkg_config_wrapper
+
   echo
   echo "==> GCC final installed to ${PREFIX}"
   echo "==> SYSROOT: ${SYSROOT}"
@@ -1066,6 +1096,12 @@ build_all() {
   build_gcc_stage1
   build_musl
   build_gcc_final
+}
+
+install_pkg_config_wrapper_command() {
+  validate_settings
+  install_pkg_config_wrapper
+  write_manifest
 }
 
 # ------------------------------ Main ------------------------------------------
@@ -1082,6 +1118,7 @@ Commands:
   musl       Build+install musl into SYSROOT (requires headers + stage1)
   gcc        Build+install final GCC (C,C++) into PREFIX (requires musl)
   build      Build binutils + headers + stage1 + musl + gcc
+  pkg-config-wrapper Install/update ${TARGET}-pkg-config in PREFIX/bin
   distclean  Remove workspace build artifacts, sources, tarballs, logs, and build GPG cache; keep PREFIX
 
 Env toggles:
@@ -1130,6 +1167,7 @@ main() {
     musl)     validate_settings; reset_logs_for_run; build_musl ;;
     gcc)      validate_settings; reset_logs_for_run; build_gcc_final ;;
     build)    validate_settings; reset_logs_for_run; build_all ;;
+    pkg-config-wrapper) install_pkg_config_wrapper_command ;;
     distclean) distclean ;;
     ""|help|-h|--help) usage ;;
     *) die "unknown command: ${cmd}" ;;

@@ -534,6 +534,7 @@ need_paths() {
   [[ -x "${TC_PREFIX}/bin/${TARGET}-g++" ]] || die "missing compiler: ${TC_PREFIX}/bin/${TARGET}-g++"
   [[ -x "${TC_PREFIX}/bin/${TARGET}-ar"  ]] || die "missing: ${TC_PREFIX}/bin/${TARGET}-ar"
   [[ -x "${TC_PREFIX}/bin/${TARGET}-ranlib"  ]] || die "missing: ${TC_PREFIX}/bin/${TARGET}-ranlib"
+  [[ -x "${TC_PREFIX}/bin/${TARGET}-pkg-config" ]] || die "missing pkg-config wrapper: ${TC_PREFIX}/bin/${TARGET}-pkg-config"
   [[ -d "${SYSROOT}/usr/include" ]] || die "missing sysroot headers: ${SYSROOT}/usr/include"
 
   detect_link_mode
@@ -773,6 +774,110 @@ EOF
     readelf -l '${WORK_DIR}/bin/link_audit' | grep -E 'Requesting program interpreter' || true
     readelf -d '${WORK_DIR}/bin/link_audit' | grep -E 'NEEDED' || true
   "
+}
+
+assert_pkg_config_wrapper() {
+  have_cmd pkg-config || die "missing host pkg-config"
+
+  local wrapper="${TC_PREFIX}/bin/${TARGET}-pkg-config"
+  local pcroot="${WORK_DIR}/pkg-config-sysroot"
+  local usr_pc="${pcroot}/usr/lib/pkgconfig"
+  local lib_pc="${pcroot}/lib/pkgconfig"
+  local share_pc="${pcroot}/usr/share/pkgconfig"
+  local overlay_pc="${WORK_DIR}/pkg-config-overlay"
+  local host_pc="${WORK_DIR}/pkg-config-host"
+
+  mkdirp "${usr_pc}" "${lib_pc}" "${share_pc}" "${overlay_pc}" "${host_pc}"
+
+  cat > "${usr_pc}/wrapper-usr.pc" <<'EOF'
+prefix=/usr
+includedir=${prefix}/include/wrapper-usr
+libdir=${prefix}/lib
+
+Name: wrapper-usr
+Description: musl usr pkg-config wrapper probe
+Version: 1.0
+Cflags: -I${includedir}
+Libs: -L${libdir} -lwrapper-usr
+EOF
+
+  cat > "${lib_pc}/wrapper-lib.pc" <<'EOF'
+prefix=
+includedir=/include/wrapper-lib
+libdir=/lib
+
+Name: wrapper-lib
+Description: musl root lib pkg-config wrapper probe
+Version: 1.0
+Cflags: -I${includedir}
+Libs: -L${libdir} -lwrapper-lib
+EOF
+
+  cat > "${share_pc}/wrapper-share.pc" <<'EOF'
+prefix=/usr
+includedir=${prefix}/include/wrapper-share
+
+Name: wrapper-share
+Description: musl share pkg-config wrapper probe
+Version: 1.0
+Cflags: -I${includedir}
+Libs:
+EOF
+
+  cat > "${overlay_pc}/wrapper-overlay.pc" <<'EOF'
+prefix=/opt/wrapper-overlay
+includedir=${prefix}/include
+
+Name: wrapper-overlay
+Description: explicit target overlay pkg-config wrapper probe
+Version: 1.0
+Cflags: -I${includedir}
+Libs:
+EOF
+
+  cat > "${host_pc}/wrapper-host-leak.pc" <<'EOF'
+prefix=/usr
+includedir=${prefix}/include/host-leak
+
+Name: wrapper-host-leak
+Description: inherited host PKG_CONFIG_PATH leak probe
+Version: 1.0
+Cflags: -I${includedir}
+Libs:
+EOF
+
+  run_logged "pkg-config-wrapper" env \
+    PKG_CONFIG_PATH="${host_pc}" \
+    PKG_CONFIG_SYSROOT_DIR="/host-leak-sysroot" \
+    PKG_CONFIG_LIBDIR="/host/leak/pkgconfig" \
+    TARGET_PKG_CONFIG_SYSROOT_DIR="${pcroot}" \
+    TARGET_PKG_CONFIG_PATH= \
+    "${wrapper}" \
+    --cflags --libs wrapper-usr wrapper-lib wrapper-share
+
+  local logf="${LOG_DIR}/pkg-config-wrapper.log"
+  [[ -f "${logf}" ]] || die "missing pkg-config wrapper log: ${logf}"
+  grep -F -- "-I${pcroot}/usr/include/wrapper-usr" "${logf}" >/dev/null \
+    || die "pkg-config wrapper did not sysroot usr Cflags"
+  grep -F -- "-L${pcroot}/usr/lib" "${logf}" >/dev/null \
+    || die "pkg-config wrapper did not sysroot usr Libs"
+  grep -F -- "-I${pcroot}/include/wrapper-lib" "${logf}" >/dev/null \
+    || die "pkg-config wrapper did not search root lib pkgconfig dir"
+  grep -F -- "-L${pcroot}/lib" "${logf}" >/dev/null \
+    || die "pkg-config wrapper did not sysroot root lib Libs"
+  grep -F -- "-I${pcroot}/usr/include/wrapper-share" "${logf}" >/dev/null \
+    || die "pkg-config wrapper did not search usr/share pkgconfig dir"
+
+  if env PKG_CONFIG_PATH="${host_pc}" TARGET_PKG_CONFIG_SYSROOT_DIR="${pcroot}" TARGET_PKG_CONFIG_PATH= "${wrapper}" --exists wrapper-host-leak; then
+    die "pkg-config wrapper leaked inherited host PKG_CONFIG_PATH"
+  fi
+
+  run_logged "pkg-config-wrapper-overlay" env \
+    TARGET_PKG_CONFIG_SYSROOT_DIR="${pcroot}" \
+    TARGET_PKG_CONFIG_PATH="${overlay_pc}" \
+    "${wrapper}" --cflags wrapper-overlay
+  grep -F -- "-I${pcroot}/opt/wrapper-overlay/include" "${LOG_DIR}/pkg-config-wrapper-overlay.log" >/dev/null \
+    || die "pkg-config wrapper did not honor TARGET_PKG_CONFIG_PATH"
 }
 
 # ------------------------------ Pi musl runtime staging ------------------------
@@ -1900,6 +2005,7 @@ tier_sanity() {
   "
 
   sysroot_link_audit
+  assert_pkg_config_wrapper
 
   build_binaries
   inspect_elf "${WORK_DIR}/bin/hello_c"
