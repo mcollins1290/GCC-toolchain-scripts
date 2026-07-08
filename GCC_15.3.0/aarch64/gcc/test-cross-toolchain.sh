@@ -403,6 +403,7 @@ need_paths() {
   [[ -x "${TC_PREFIX}/bin/${TARGET}-g++" ]] || die "missing compiler: ${TC_PREFIX}/bin/${TARGET}-g++"
   [[ -x "${TC_PREFIX}/bin/${TARGET}-ar"  ]] || die "missing: ${TC_PREFIX}/bin/${TARGET}-ar"
   [[ -x "${TC_PREFIX}/bin/${TARGET}-ranlib"  ]] || die "missing: ${TC_PREFIX}/bin/${TARGET}-ranlib"
+  [[ -x "${TC_PREFIX}/bin/${TARGET}-pkg-config" ]] || die "missing pkg-config wrapper: ${TC_PREFIX}/bin/${TARGET}-pkg-config"
   [[ -d "${SYSROOT}/usr/include" ]] || die "missing sysroot headers: ${SYSROOT}/usr/include"
   sysroot_loader >/dev/null || die "missing sysroot loader ld-linux-aarch64.so.1 under ${SYSROOT}"
 }
@@ -459,6 +460,94 @@ assert_sysroot_abi() {
     find '${SYSROOT}' -type f -name 'libc.so.6' -print -quit
     find '${SYSROOT}' -path '*ld-linux-aarch64.so.1' -print 2>/dev/null | sort
   "
+}
+
+assert_pkg_config_wrapper() {
+  have_cmd pkg-config || die "missing host pkg-config"
+
+  local wrapper="${TC_PREFIX}/bin/${TARGET}-pkg-config"
+  local pcroot="${WORK_DIR}/pkg-config-sysroot"
+  local target_pc="${pcroot}/usr/lib/${TARGET}/pkgconfig"
+  local generic_pc="${pcroot}/usr/lib/pkgconfig"
+  local overlay_pc="${WORK_DIR}/pkg-config-overlay"
+  local host_pc="${WORK_DIR}/pkg-config-host"
+
+  mkdirp "${target_pc}" "${generic_pc}" "${overlay_pc}" "${host_pc}"
+
+  cat > "${target_pc}/wrapper-target.pc" <<EOF
+prefix=/usr
+includedir=\${prefix}/include/wrapper-target
+libdir=\${prefix}/lib/${TARGET}
+
+Name: wrapper-target
+Description: target pkg-config wrapper probe
+Version: 1.0
+Cflags: -I\${includedir}
+Libs: -L\${libdir} -lwrapper-target
+EOF
+
+  cat > "${generic_pc}/wrapper-generic.pc" <<'EOF'
+prefix=/usr
+includedir=${prefix}/include/wrapper-generic
+
+Name: wrapper-generic
+Description: generic sysroot pkg-config wrapper probe
+Version: 1.0
+Cflags: -I${includedir}
+Libs:
+EOF
+
+  cat > "${overlay_pc}/wrapper-overlay.pc" <<'EOF'
+prefix=/opt/wrapper-overlay
+includedir=${prefix}/include
+
+Name: wrapper-overlay
+Description: explicit target overlay pkg-config wrapper probe
+Version: 1.0
+Cflags: -I${includedir}
+Libs:
+EOF
+
+  cat > "${host_pc}/wrapper-host-leak.pc" <<'EOF'
+prefix=/usr
+includedir=${prefix}/include/host-leak
+
+Name: wrapper-host-leak
+Description: inherited host PKG_CONFIG_PATH leak probe
+Version: 1.0
+Cflags: -I${includedir}
+Libs:
+EOF
+
+  run_logged "pkg-config-wrapper" env \
+    PKG_CONFIG_PATH="${host_pc}" \
+    PKG_CONFIG_SYSROOT_DIR="/host-leak-sysroot" \
+    PKG_CONFIG_LIBDIR="/host/leak/pkgconfig" \
+    TARGET_PKG_CONFIG_SYSROOT_DIR="${pcroot}" \
+    TARGET_PKG_CONFIG_PATH= \
+    "${wrapper}" \
+    --define-variable=prefix=/usr \
+    --cflags --libs wrapper-target wrapper-generic
+
+  local logf="${LOG_DIR}/pkg-config-wrapper.log"
+  [[ -f "${logf}" ]] || die "missing pkg-config wrapper log: ${logf}"
+  grep -F -- "-I${pcroot}/usr/include/wrapper-target" "${logf}" >/dev/null \
+    || die "pkg-config wrapper did not sysroot target Cflags"
+  grep -F -- "-L${pcroot}/usr/lib/${TARGET}" "${logf}" >/dev/null \
+    || die "pkg-config wrapper did not sysroot target Libs"
+  grep -F -- "-I${pcroot}/usr/include/wrapper-generic" "${logf}" >/dev/null \
+    || die "pkg-config wrapper did not search generic sysroot pkgconfig dir"
+
+  if env PKG_CONFIG_PATH="${host_pc}" TARGET_PKG_CONFIG_SYSROOT_DIR="${pcroot}" TARGET_PKG_CONFIG_PATH= "${wrapper}" --exists wrapper-host-leak; then
+    die "pkg-config wrapper leaked inherited host PKG_CONFIG_PATH"
+  fi
+
+  run_logged "pkg-config-wrapper-overlay" env \
+    TARGET_PKG_CONFIG_SYSROOT_DIR="${pcroot}" \
+    TARGET_PKG_CONFIG_PATH="${overlay_pc}" \
+    "${wrapper}" --cflags wrapper-overlay
+  grep -F -- "-I${pcroot}/opt/wrapper-overlay/include" "${LOG_DIR}/pkg-config-wrapper-overlay.log" >/dev/null \
+    || die "pkg-config wrapper did not honor TARGET_PKG_CONFIG_PATH"
 }
 
 download() {
@@ -1485,6 +1574,7 @@ tier_sanity() {
   sysroot_link_audit
 
   assert_sysroot_abi
+  assert_pkg_config_wrapper
   build_binaries
   assert_default_hardening
   assert_toolchain_runtime_libs

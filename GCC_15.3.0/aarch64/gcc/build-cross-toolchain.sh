@@ -485,6 +485,35 @@ libc_version_from_sysroot() {
   fi
 }
 
+install_pkg_config_wrapper() {
+  local effective wrapper
+  effective="$(effective_sysroot)"
+  wrapper="${PREFIX}/bin/${TARGET}-pkg-config"
+
+  mkdirp "$(dirname "${wrapper}")"
+  cat > "${wrapper}" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+target="${TARGET}"
+sysroot="\${TARGET_PKG_CONFIG_SYSROOT_DIR:-${effective}}"
+pkg_config_bin="\${PKG_CONFIG_BIN:-pkg-config}"
+
+export PKG_CONFIG_SYSROOT_DIR="\${sysroot}"
+export PKG_CONFIG_LIBDIR="\${sysroot}/usr/lib/\${target}/pkgconfig:\${sysroot}/usr/lib/pkgconfig:\${sysroot}/usr/share/pkgconfig"
+
+if [[ -n "\${TARGET_PKG_CONFIG_PATH:-}" ]]; then
+  export PKG_CONFIG_PATH="\${TARGET_PKG_CONFIG_PATH}"
+else
+  unset PKG_CONFIG_PATH
+fi
+
+exec "\${pkg_config_bin}" "\$@"
+EOF
+  chmod 0755 "${wrapper}"
+  echo "==> installed pkg-config wrapper: ${wrapper}"
+}
+
 write_manifest() {
   export_basic_env
   mkdirp "$(dirname "${MANIFEST_FILE}")"
@@ -536,6 +565,7 @@ write_manifest() {
     echo "gcc_with_as=${with_as:-auto}"
     echo "gcc_with_ld=${with_ld:-auto}"
     echo "libc_version=$(libc_version_from_sysroot)"
+    echo "pkg_config_wrapper=${PREFIX}/bin/${TARGET}-pkg-config"
     echo
     echo "[configure.binutils]"
     echo "--build=${build} --host=${host} --target=${TARGET} --prefix=${PREFIX} --with-sysroot=${effective} --disable-multilib --disable-werror --disable-nls --enable-plugins --enable-lto --enable-ld=default --enable-relro --enable-default-hash-style=${DEFAULT_HASH_STYLE} --with-zstd=${BINUTILS_ZSTD} --with-system-zlib"
@@ -692,6 +722,8 @@ build_toolchain() {
     make install
   "
 
+  install_pkg_config_wrapper
+
   echo
   echo "==> GCC installed to ${PREFIX}"
   write_manifest
@@ -700,6 +732,12 @@ build_toolchain() {
 build_all() {
   build_binutils
   build_toolchain
+}
+
+install_pkg_config_wrapper_command() {
+  validate_core_settings
+  install_pkg_config_wrapper
+  write_manifest
 }
 
 # ------------------------------ Main ------------------------------------------
@@ -713,6 +751,7 @@ Commands:
   binutils   Download/extract (if needed) + build+install cross binutils into PREFIX
   gcc        Download/extract (if needed) + build+install final GCC (C,C++) into PREFIX
   build      Build binutils then GCC
+  pkg-config-wrapper Install/update ${TARGET}-pkg-config in PREFIX/bin
   distclean  Remove workspace build artifacts, sources, tarballs, logs, and build GPG cache; keep PREFIX
 
 Env toggles:
@@ -748,6 +787,7 @@ main() {
     binutils) build_binutils ;;
     gcc)      build_toolchain ;;
     build)    build_all ;;
+    pkg-config-wrapper) install_pkg_config_wrapper_command ;;
     distclean) distclean ;;
     ""|help|-h|--help) usage ;;
     *) die "unknown command: ${cmd}" ;;
