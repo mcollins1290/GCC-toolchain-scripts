@@ -51,6 +51,7 @@ PI_NET_TEST_URL="${PI_NET_TEST_URL:-https://example.com}"
 
 # When set, we stage a CA bundle into INSTALL_DIR and use it via explicit --cacert
 PI_TLS_SELFCONTAINED="${PI_TLS_SELFCONTAINED:-0}"
+TLS_CA_BUNDLE="${TLS_CA_BUNDLE:-}"
 CA_BUNDLE_URL="${CA_BUNDLE_URL:-https://curl.se/ca/cacert.pem}"
 
 # Stress toggles (rare failure modes)
@@ -111,6 +112,7 @@ FRESH_LOGS="${FRESH_LOGS:-1}"
 EXIT_CLEANUP_ENABLED=0
 REMOTE_TMPDIR_USED=0
 REMOTE_INTEGRATION_USED=0
+declare -A RUN_LOGGED_SEEN=()
 
 # ------------------------------ A+ Super Suite Switch --------------------------
 A_PLUS="${A_PLUS:-0}"
@@ -477,6 +479,10 @@ run_logged() {
   local name="$1"; shift
   local logf="${LOG_DIR}/${name}.log"
   mkdirp "${LOG_DIR}"
+  if [[ "${FRESH_LOGS}" == "1" && -z "${RUN_LOGGED_SEEN[${name}]+x}" ]]; then
+    rm -f -- "${logf}"
+    RUN_LOGGED_SEEN["${name}"]=1
+  fi
   log "${name}"
   echo "    log: ${logf}"
   ( "$@" ) > >(tee -a "${logf}") 2> >(tee -a "${logf}" 1>&2)
@@ -942,14 +948,11 @@ stage_pi_musl_runtime_tree() {
     "libssp.so.0" || true
 
   if [[ "${PI_TLS_SELFCONTAINED}" == "1" ]]; then
-    if [[ -f "${SYSROOT}/etc/ssl/certs/ca-certificates.crt" ]]; then
-      cp -aL "${SYSROOT}/etc/ssl/certs/ca-certificates.crt" "${rt}/etc/ssl/certs/ca-certificates.crt"
-    elif [[ -f "${PI_SYSROOT}/etc/ssl/certs/ca-certificates.crt" ]]; then
-      cp -aL "${PI_SYSROOT}/etc/ssl/certs/ca-certificates.crt" "${rt}/etc/ssl/certs/ca-certificates.crt"
-    elif [[ -f "/etc/ssl/certs/ca-certificates.crt" ]]; then
-      cp -aL "/etc/ssl/certs/ca-certificates.crt" "${rt}/etc/ssl/certs/ca-certificates.crt"
+    local ca_src=""
+    if ca_src="$(find_tls_ca_bundle)"; then
+      cp -aL "${ca_src}" "${rt}/etc/ssl/certs/ca-certificates.crt"
     else
-      echo "WARNING: PI_TLS_SELFCONTAINED=1 but no CA bundle found in SYSROOT, PI_SYSROOT, or host /etc/ssl/certs" >&2
+      echo "WARNING: PI_TLS_SELFCONTAINED=1 but no valid CA bundle found in TLS_CA_BUNDLE, SYSROOT, PI_SYSROOT, or host trust paths" >&2
     fi
   fi
 
@@ -1412,13 +1415,49 @@ integration_prepare() {
   mkdirp "${TARBALL_DIR}" "${SRC_DIR}" "${BUILD_DIR}" "${INSTALL_DIR}"
 }
 
+path_without_stale_target_toolchains() {
+  local original="$1"
+  local prefix_bin="${TC_PREFIX}/bin"
+  local out="" dir
+  local -a path_parts
+
+  IFS=':' read -r -a path_parts <<< "${original}"
+  for dir in "${path_parts[@]}"; do
+    [[ -n "${dir}" ]] || continue
+    [[ "${dir}" == "${prefix_bin}" ]] && continue
+
+    if [[ "${dir}" == /opt/gcc-*/bin ]] \
+      && [[ -x "${dir}/${TARGET}-gcc" || -x "${dir}/${TARGET}-g++" || -x "${dir}/${TARGET}-pkg-config" ]]; then
+      continue
+    fi
+
+    if [[ -z "${out}" ]]; then
+      out="${dir}"
+    else
+      out="${out}:${dir}"
+    fi
+  done
+
+  printf '%s\n' "${out}"
+}
+
 export_integration_env() {
+  local sanitized_path
+
+  sanitized_path="$(path_without_stale_target_toolchains "${PATH}")"
+  export PATH="${TC_PREFIX}/bin:${sanitized_path}"
   export CC="${TC_PREFIX}/bin/${TARGET}-gcc"
   export CXX="${TC_PREFIX}/bin/${TARGET}-g++"
   export AR="${TC_PREFIX}/bin/${TARGET}-ar"
-  export RANLIB="${TC_PREFIX}/bin/${TARGET}-ranlib"
-  export STRIP="${TC_PREFIX}/bin/${TARGET}-strip"
+  export AS="${TC_PREFIX}/bin/${TARGET}-as"
   export LD="${TC_PREFIX}/bin/${TARGET}-ld"
+  export NM="${TC_PREFIX}/bin/${TARGET}-nm"
+  export OBJCOPY="${TC_PREFIX}/bin/${TARGET}-objcopy"
+  export OBJDUMP="${TC_PREFIX}/bin/${TARGET}-objdump"
+  export RANLIB="${TC_PREFIX}/bin/${TARGET}-ranlib"
+  export READELF="${TC_PREFIX}/bin/${TARGET}-readelf"
+  export STRIP="${TC_PREFIX}/bin/${TARGET}-strip"
+  export PKG_CONFIG="${TC_PREFIX}/bin/${TARGET}-pkg-config"
   export CFLAGS="${CFLAGS:--O2 -pipe} --sysroot=${SYSROOT}"
   export CXXFLAGS="${CXXFLAGS:--O2 -pipe} --sysroot=${SYSROOT}"
   export LDFLAGS="${LDFLAGS:-} --sysroot=${SYSROOT}"
@@ -1428,43 +1467,68 @@ export_integration_env() {
   export PKG_CONFIG_PATH="${INSTALL_DIR}/lib/pkgconfig:${INSTALL_DIR}/share/pkgconfig"
 }
 
+find_tls_ca_bundle() {
+  local candidate resolved
+  local -a candidates=()
+
+  if [[ -n "${TLS_CA_BUNDLE}" ]]; then
+    candidates+=("${TLS_CA_BUNDLE}")
+  fi
+
+  candidates+=("${SYSROOT}/etc/ssl/certs/ca-certificates.crt")
+
+  if [[ -L "${SYSROOT}/usr/lib/ssl/cert.pem" ]]; then
+    resolved="$(readlink "${SYSROOT}/usr/lib/ssl/cert.pem")"
+    if [[ "${resolved}" == /* ]]; then
+      candidates+=("${SYSROOT}${resolved}")
+    else
+      candidates+=("${SYSROOT}/usr/lib/ssl/${resolved}")
+    fi
+  else
+    candidates+=("${SYSROOT}/usr/lib/ssl/cert.pem")
+  fi
+
+  candidates+=("${PI_SYSROOT}/etc/ssl/certs/ca-certificates.crt")
+
+  if [[ -L "${PI_SYSROOT}/usr/lib/ssl/cert.pem" ]]; then
+    resolved="$(readlink "${PI_SYSROOT}/usr/lib/ssl/cert.pem")"
+    if [[ "${resolved}" == /* ]]; then
+      candidates+=("${PI_SYSROOT}${resolved}")
+    else
+      candidates+=("${PI_SYSROOT}/usr/lib/ssl/${resolved}")
+    fi
+  else
+    candidates+=("${PI_SYSROOT}/usr/lib/ssl/cert.pem")
+  fi
+
+  candidates+=("/etc/ssl/certs/ca-certificates.crt")
+  candidates+=("/etc/pki/tls/certs/ca-bundle.crt")
+  candidates+=("/etc/ssl/ca-bundle.pem")
+
+  for candidate in "${candidates[@]}"; do
+    [[ -n "${candidate}" ]] || continue
+    [[ -f "${candidate}" ]] || continue
+    if grep -q -- "-----BEGIN CERTIFICATE-----" "${candidate}"; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 integration_stage_ca_bundle() {
   [[ "${PI_TLS_SELFCONTAINED}" == "1" ]] || return 0
 
   local dest="${INSTALL_DIR}/ssl/certs/ca-certificates.crt"
   mkdirp "$(dirname "${dest}")"
 
-  local sys_ca="${SYSROOT}/etc/ssl/certs/ca-certificates.crt"
-  local pi_ca="${PI_SYSROOT}/etc/ssl/certs/ca-certificates.crt"
-  local host_ca="/etc/ssl/certs/ca-certificates.crt"
-
-  if [[ -s "${sys_ca}" ]]; then
+  local ca_src=""
+  if ca_src="$(find_tls_ca_bundle)"; then
     run_logged "integration-stage-ca-bundle" bash -c "
       set -e
-      cp -f '${sys_ca}' '${dest}'
-      echo 'staged_ca_bundle_src=${sys_ca}'
-      echo 'staged_ca_bundle_dest=${dest}'
-      wc -c '${dest}' | awk '{print \$1, \$2}'
-    "
-    return 0
-  fi
-
-  if [[ -s "${pi_ca}" ]]; then
-    run_logged "integration-stage-ca-bundle" bash -c "
-      set -e
-      cp -f '${pi_ca}' '${dest}'
-      echo 'staged_ca_bundle_src=${pi_ca}'
-      echo 'staged_ca_bundle_dest=${dest}'
-      wc -c '${dest}' | awk '{print \$1, \$2}'
-    "
-    return 0
-  fi
-
-  if [[ -s "${host_ca}" ]]; then
-    run_logged "integration-stage-ca-bundle" bash -c "
-      set -e
-      cp -f '${host_ca}' '${dest}'
-      echo 'staged_ca_bundle_src=${host_ca}'
+      cp -f '${ca_src}' '${dest}'
+      echo 'staged_ca_bundle_src=${ca_src}'
       echo 'staged_ca_bundle_dest=${dest}'
       wc -c '${dest}' | awk '{print \$1, \$2}'
     "
@@ -1473,7 +1537,7 @@ integration_stage_ca_bundle() {
 
   run_logged "integration-stage-ca-bundle" bash -c "
     set -e
-    echo 'No CA bundle found in SYSROOT, PI_SYSROOT, or host /etc/ssl/certs.'
+    echo 'No valid CA bundle found in TLS_CA_BUNDLE, SYSROOT, PI_SYSROOT, or host trust paths.'
     echo 'Falling back to download: ${CA_BUNDLE_URL}'
   "
 

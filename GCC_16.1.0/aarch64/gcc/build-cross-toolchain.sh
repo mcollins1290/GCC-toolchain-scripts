@@ -99,6 +99,43 @@ log_step() {
   ( "$@" ) > >(tee -a "${log}") 2> >(tee -a "${log}" 1>&2)
 }
 
+path_without_stale_target_compilers() {
+  local original="$1"
+  local prefix_bin="${PREFIX}/bin"
+  local out="" dir
+
+  IFS=':' read -r -a path_parts <<< "${original}"
+  for dir in "${path_parts[@]}"; do
+    [[ -n "${dir}" ]] || continue
+    [[ "${dir}" == "${prefix_bin}" ]] && continue
+
+    if [[ "${dir}" == /opt/gcc-*/bin ]] \
+      && [[ -x "${dir}/${TARGET}-gcc" || -x "${dir}/${TARGET}-g++" || -x "${dir}/${TARGET}-c++" ]]; then
+      continue
+    fi
+
+    if [[ -z "${out}" ]]; then
+      out="${dir}"
+    else
+      out="${out}:${dir}"
+    fi
+  done
+
+  printf '%s\n' "${out}"
+}
+
+binutils_bootstrap_env() {
+  env \
+    CC_FOR_TARGET=/bin/false \
+    CXX_FOR_TARGET=/bin/false \
+    GCC_FOR_TARGET=/bin/false \
+    GFORTRAN_FOR_TARGET=/bin/false \
+    GOC_FOR_TARGET=/bin/false \
+    GDC_FOR_TARGET=/bin/false \
+    GM2_FOR_TARGET=/bin/false \
+    "$@"
+}
+
 clean_prefix_once() {
   [[ "${CLEAN_PREFIX}" == "1" ]] || return 0
   [[ "${PREFIX_CLEANED}" == "0" ]] || return 0
@@ -299,6 +336,8 @@ print_source_hashes() {
 
 # ------------------------------ Env ------------------------------------------
 export_basic_env() {
+  local sanitized_path
+
   export LC_ALL=C
   umask 022
 
@@ -307,7 +346,9 @@ export_basic_env() {
   PREFIX="${PREFIX%/}"
 
   # Keep environment clean: do NOT export LD_LIBRARY_PATH globally.
-  export PATH="${ACTIVE_PREFIX}/bin:${PATH}"
+  # Also avoid discovering older target compilers from another /opt toolchain.
+  sanitized_path="$(path_without_stale_target_compilers "${PATH}")"
+  export PATH="${ACTIVE_PREFIX}/bin:${sanitized_path}"
 
   export CFLAGS="${CFLAGS:--O2 -pipe}"
   export CXXFLAGS="${CXXFLAGS:--O2 -pipe}"
@@ -595,7 +636,7 @@ build_binutils() {
   host="${HOST_TRIPLET:-${build}}"
   sysroot_for_build="$(effective_sysroot)"
 
-  log_step "configure-binutils" bash -lc "
+  log_step "configure-binutils" binutils_bootstrap_env bash -c "
     cd '${BINUTILS_BUILD_DIR}'
     '${BINUTILS_SRC_DIR}/configure' \
       --build='${build}' \
@@ -615,12 +656,12 @@ build_binutils() {
       --with-system-zlib
   "
 
-  log_step "build-binutils" bash -lc "
+  log_step "build-binutils" binutils_bootstrap_env bash -c "
     cd '${BINUTILS_BUILD_DIR}'
     make -j'${JOBS}'
   "
 
-  log_step "install-binutils" bash -lc "
+  log_step "install-binutils" binutils_bootstrap_env bash -c "
     cd '${BINUTILS_BUILD_DIR}'
     make install
   "
@@ -678,7 +719,7 @@ build_toolchain() {
   host="${HOST_TRIPLET:-${build}}"
   sysroot_for_build="$(effective_sysroot)"
 
-  log_step "configure-gcc-final" bash -lc "
+  log_step "configure-gcc-final" bash -c "
     cd '${gcc_build}'
     '${GCC_SRC_DIR}/configure' \
       --build='${build}' \
@@ -712,12 +753,12 @@ build_toolchain() {
       ${with_as} ${with_ld}
   "
 
-  log_step "build-gcc-final" bash -lc "
+  log_step "build-gcc-final" bash -c "
     cd '${gcc_build}'
     make -j'${JOBS}'
   "
 
-  log_step "install-gcc-final" bash -lc "
+  log_step "install-gcc-final" bash -c "
     cd '${gcc_build}'
     make install
   "

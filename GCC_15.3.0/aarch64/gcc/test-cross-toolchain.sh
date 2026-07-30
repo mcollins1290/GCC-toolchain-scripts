@@ -34,6 +34,7 @@ PI_NET_TEST_URL="${PI_NET_TEST_URL:-https://example.com}"
 
 # When set, we stage a CA bundle into INSTALL_DIR and use it via CURL_CA_BUNDLE
 PI_TLS_SELFCONTAINED="${PI_TLS_SELFCONTAINED:-0}"
+TLS_CA_BUNDLE="${TLS_CA_BUNDLE:-}"
 
 # Stress toggles (rare failure modes)
 STRESS_CPP="${STRESS_CPP:-0}"
@@ -87,6 +88,7 @@ FRESH_LOGS="${FRESH_LOGS:-1}"
 EXIT_CLEANUP_ENABLED=0
 REMOTE_TMPDIR_USED=0
 REMOTE_INTEGRATION_USED=0
+declare -A RUN_LOGGED_SEEN=()
 
 # ------------------------------ A+ Super Suite Switch --------------------------
 # When A_PLUS=1, automatically enable all heavy integration + stress tests.
@@ -371,6 +373,10 @@ run_logged() {
   local name="$1"; shift
   local logf="${LOG_DIR}/${name}.log"
   mkdirp "${LOG_DIR}"
+  if [[ "${FRESH_LOGS}" == "1" && -z "${RUN_LOGGED_SEEN[${name}]+x}" ]]; then
+    rm -f -- "${logf}"
+    RUN_LOGGED_SEEN["${name}"]=1
+  fi
   log "${name}"
   echo "    log: ${logf}"
   ( "$@" ) > >(tee -a "${logf}") 2> >(tee -a "${logf}" 1>&2)
@@ -453,7 +459,7 @@ assert_sysroot_abi() {
   glibc="$(sysroot_glibc_version || true)"
   [[ -n "${glibc}" ]] || die "could not determine sysroot glibc version from ${SYSROOT}"
 
-  run_logged "sysroot-abi" bash -lc "
+  run_logged "sysroot-abi" bash -c "
     set -e
     echo 'sysroot=${SYSROOT}'
     echo 'glibc_version=${glibc}'
@@ -657,7 +663,7 @@ EOF
     die "sysroot purity violated: linker opened host x86_64 files (see ${logf})."
   fi
 
-  run_logged "sanity-link-audit-inspect" bash -lc "
+  run_logged "sanity-link-audit-inspect" bash -c "
     set -e
     file '${WORK_DIR}/bin/link_audit'
     readelf -l '${WORK_DIR}/bin/link_audit' | grep -E 'Requesting program interpreter' || true
@@ -925,7 +931,7 @@ build_binaries() {
     -ldl -Wl,-rpath,"${origin_rpath}"
 
   # Make dlopen("./libthrow.so") succeed when running from WORK_DIR/bin
-  run_logged "build-libthrow-symlink" bash -lc "
+  run_logged "build-libthrow-symlink" bash -c "
     set -e
     ln -sf ../lib/libthrow.so '${WORK_DIR}/bin/libthrow.so'
     ls -l '${WORK_DIR}/bin/libthrow.so'
@@ -947,13 +953,13 @@ build_binaries() {
     "${WORK_DIR}/src/rtld_collision.c" -o "${WORK_DIR}/bin/rtld_collision" \
     -ldl -Wl,-rpath,"${origin_rpath}"
 
-  run_logged "build-symlink-sym-a" bash -lc "set -e; ln -sf ../lib/libsym_a.so '${WORK_DIR}/bin/libsym_a.so'; ls -l '${WORK_DIR}/bin/libsym_a.so'"
-  run_logged "build-symlink-sym-b" bash -lc "set -e; ln -sf ../lib/libsym_b.so '${WORK_DIR}/bin/libsym_b.so'; ls -l '${WORK_DIR}/bin/libsym_b.so'"
+  run_logged "build-symlink-sym-a" bash -c "set -e; ln -sf ../lib/libsym_a.so '${WORK_DIR}/bin/libsym_a.so'; ls -l '${WORK_DIR}/bin/libsym_a.so'"
+  run_logged "build-symlink-sym-b" bash -c "set -e; ln -sf ../lib/libsym_b.so '${WORK_DIR}/bin/libsym_b.so'; ls -l '${WORK_DIR}/bin/libsym_b.so'"
 }
 
 inspect_elf() {
   local bin="$1"
-  run_logged "inspect-$(basename "$bin")" bash -lc "
+  run_logged "inspect-$(basename "$bin")" bash -c "
     set -e
     echo '--- file ---'
     file '$bin'
@@ -986,7 +992,7 @@ EOF
     "${WORK_DIR}/src/hardening.c" -o "${WORK_DIR}/bin/hardening_now" \
     -Wl,-z,now
 
-  run_logged "hardening-assert-defaults" bash -lc "
+  run_logged "hardening-assert-defaults" bash -c "
     set -e
     bin='${WORK_DIR}/bin/hardening_default'
     nowbin='${WORK_DIR}/bin/hardening_now'
@@ -1033,7 +1039,7 @@ assert_toolchain_runtime_libs() {
   [[ -f "${libstdcxx}" ]] || die "fresh libstdc++.so.6 not found via compiler: ${libstdcxx}"
   [[ -f "${libgcc}" ]] || die "fresh libgcc not found via compiler: ${libgcc}"
 
-  run_logged "runtime-lib-provenance" bash -lc "
+  run_logged "runtime-lib-provenance" bash -c "
     set -e
     echo 'libstdcxx=${libstdcxx}'
     echo 'libgcc=${libgcc}'
@@ -1107,12 +1113,49 @@ integration_prepare() {
   mkdirp "${TARBALL_DIR}" "${SRC_DIR}" "${BUILD_DIR}" "${INSTALL_DIR}"
 }
 
+path_without_stale_target_toolchains() {
+  local original="$1"
+  local prefix_bin="${TC_PREFIX}/bin"
+  local out="" dir
+  local -a path_parts
+
+  IFS=':' read -r -a path_parts <<< "${original}"
+  for dir in "${path_parts[@]}"; do
+    [[ -n "${dir}" ]] || continue
+    [[ "${dir}" == "${prefix_bin}" ]] && continue
+
+    if [[ "${dir}" == /opt/gcc-*/bin ]] \
+      && [[ -x "${dir}/${TARGET}-gcc" || -x "${dir}/${TARGET}-g++" || -x "${dir}/${TARGET}-pkg-config" ]]; then
+      continue
+    fi
+
+    if [[ -z "${out}" ]]; then
+      out="${dir}"
+    else
+      out="${out}:${dir}"
+    fi
+  done
+
+  printf '%s\n' "${out}"
+}
+
 export_integration_env() {
+  local sanitized_path
+
+  sanitized_path="$(path_without_stale_target_toolchains "${PATH}")"
+  export PATH="${TC_PREFIX}/bin:${sanitized_path}"
   export CC="${TC_PREFIX}/bin/${TARGET}-gcc"
   export CXX="${TC_PREFIX}/bin/${TARGET}-g++"
   export AR="${TC_PREFIX}/bin/${TARGET}-ar"
+  export AS="${TC_PREFIX}/bin/${TARGET}-as"
+  export LD="${TC_PREFIX}/bin/${TARGET}-ld"
+  export NM="${TC_PREFIX}/bin/${TARGET}-nm"
+  export OBJCOPY="${TC_PREFIX}/bin/${TARGET}-objcopy"
+  export OBJDUMP="${TC_PREFIX}/bin/${TARGET}-objdump"
   export RANLIB="${TC_PREFIX}/bin/${TARGET}-ranlib"
+  export READELF="${TC_PREFIX}/bin/${TARGET}-readelf"
   export STRIP="${TC_PREFIX}/bin/${TARGET}-strip"
+  export PKG_CONFIG="${TC_PREFIX}/bin/${TARGET}-pkg-config"
   export CFLAGS="${CFLAGS:--O2 -pipe} --sysroot=${SYSROOT}"
   export CXXFLAGS="${CXXFLAGS:--O2 -pipe} --sysroot=${SYSROOT}"
   export LDFLAGS="${LDFLAGS:-} --sysroot=${SYSROOT}"
@@ -1125,19 +1168,56 @@ export_integration_env() {
 integration_stage_ca_bundle() {
   [[ "${PI_TLS_SELFCONTAINED}" == "1" ]] || return 0
 
-  local src="${SYSROOT}/etc/ssl/certs/ca-certificates.crt"
+  local src=""
   local dest="${INSTALL_DIR}/ssl/certs/ca-certificates.crt"
 
-  [[ -f "${src}" ]] || die "CA bundle not found in sysroot: ${src}"
+  src="$(find_tls_ca_bundle)"
   mkdirp "$(dirname "${dest}")"
 
-  run_logged "integration-stage-ca-bundle" bash -lc "
+  run_logged "integration-stage-ca-bundle" bash -c "
     set -e
     cp -f '${src}' '${dest}'
     echo 'staged_ca_bundle_src=${src}'
     echo 'staged_ca_bundle_dest=${dest}'
     wc -c '${dest}' | awk '{print \$1, \$2}'
   "
+}
+
+find_tls_ca_bundle() {
+  local candidate resolved
+  local -a candidates=()
+
+  if [[ -n "${TLS_CA_BUNDLE}" ]]; then
+    candidates+=("${TLS_CA_BUNDLE}")
+  fi
+
+  candidates+=("${SYSROOT}/etc/ssl/certs/ca-certificates.crt")
+
+  if [[ -L "${SYSROOT}/usr/lib/ssl/cert.pem" ]]; then
+    resolved="$(readlink "${SYSROOT}/usr/lib/ssl/cert.pem")"
+    if [[ "${resolved}" == /* ]]; then
+      candidates+=("${SYSROOT}${resolved}")
+    else
+      candidates+=("${SYSROOT}/usr/lib/ssl/${resolved}")
+    fi
+  else
+    candidates+=("${SYSROOT}/usr/lib/ssl/cert.pem")
+  fi
+
+  candidates+=("/etc/ssl/certs/ca-certificates.crt")
+  candidates+=("/etc/pki/tls/certs/ca-bundle.crt")
+  candidates+=("/etc/ssl/ca-bundle.pem")
+
+  for candidate in "${candidates[@]}"; do
+    [[ -n "${candidate}" ]] || continue
+    [[ -f "${candidate}" ]] || continue
+    if grep -q -- "-----BEGIN CERTIFICATE-----" "${candidate}"; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+
+  die "CA bundle not found; set TLS_CA_BUNDLE=/path/to/ca-certificates.crt or install/copy ca-certificates into ${SYSROOT}/etc/ssl/certs"
 }
 
 integration_zlib() {
@@ -1151,13 +1231,13 @@ integration_zlib() {
   verify_gpg_signature "${tb}" "${ZLIB_SIG_URL}"
   [[ -d "${src}" && -f "${src}/configure" ]] || extract "${tb}" "${src}"
 
-  run_logged "integration-zlib-configure" bash -lc "
+  run_logged "integration-zlib-configure" bash -c "
     set -e
     cd '${src}'
     ./configure --prefix='${INSTALL_DIR}'
   "
-  run_logged "integration-zlib-build" bash -lc "set -e; cd '${src}'; make -j'${JOBS}'"
-  run_logged "integration-zlib-install" bash -lc "set -e; cd '${src}'; make install"
+  run_logged "integration-zlib-build" bash -c "set -e; cd '${src}'; make -j'${JOBS}'"
+  run_logged "integration-zlib-install" bash -c "set -e; cd '${src}'; make install"
 }
 
 integration_openssl() {
@@ -1171,7 +1251,7 @@ integration_openssl() {
   verify_gpg_signature "${tb}" "${OPENSSL_SIG_URL}"
   [[ -d "${src}" && -f "${src}/Configure" ]] || extract "${tb}" "${src}"
 
-  run_logged "integration-openssl-configure" bash -lc "
+  run_logged "integration-openssl-configure" bash -c "
     set -e
     cd '${src}'
     ./Configure linux-aarch64 \
@@ -1179,8 +1259,8 @@ integration_openssl() {
       --openssldir='${INSTALL_DIR}/ssl' \
       no-tests
   "
-  run_logged "integration-openssl-build" bash -lc "set -e; cd '${src}'; make -j'${JOBS}'"
-  run_logged "integration-openssl-install" bash -lc "set -e; cd '${src}'; make install_sw"
+  run_logged "integration-openssl-build" bash -c "set -e; cd '${src}'; make -j'${JOBS}'"
+  run_logged "integration-openssl-install" bash -c "set -e; cd '${src}'; make install_sw"
 }
 
 integration_curl() {
@@ -1205,7 +1285,7 @@ integration_curl() {
   # IMPORTANT:
   # - Do NOT bake host build paths like ${INSTALL_DIR}/... into curl.
   # - Do set target runtime defaults to Debian/RPi trust store paths.
-  run_logged "integration-curl-configure" bash -lc "
+  run_logged "integration-curl-configure" bash -c "
     set -e
     cd '${src}'
     export CPPFLAGS='-I${INSTALL_DIR}/include'
@@ -1224,8 +1304,8 @@ integration_curl() {
       --enable-shared \
       --disable-static
   "
-  run_logged "integration-curl-build" bash -lc "set -e; cd '${src}'; make -j'${JOBS}'"
-  run_logged "integration-curl-install" bash -lc "set -e; cd '${src}'; make install"
+  run_logged "integration-curl-build" bash -c "set -e; cd '${src}'; make -j'${JOBS}'"
+  run_logged "integration-curl-install" bash -c "set -e; cd '${src}'; make install"
 }
 
 integration_fixup_binary_rpath() {
@@ -1240,7 +1320,7 @@ integration_fixup_binary_rpath() {
   # shellcheck disable=SC2016
   wanted_runpath='$ORIGIN/../lib:$ORIGIN/../lib64'
 
-  run_logged "integration-fixup-${name}-rpath-before" bash -lc "
+  run_logged "integration-fixup-${name}-rpath-before" bash -c "
     set -e
     echo 'before:'
     readelf -d '${bin}' | grep -E 'RPATH|RUNPATH' || true
@@ -1256,7 +1336,7 @@ integration_fixup_binary_rpath() {
     return 2
   fi
 
-  run_logged "integration-fixup-${name}-rpath-after" bash -lc "
+  run_logged "integration-fixup-${name}-rpath-after" bash -c "
     set -e
     echo 'after:'
     readelf -d '${bin}' | grep -E 'RPATH|RUNPATH'
@@ -1279,7 +1359,7 @@ integration_run_on_pi() {
     run_logged "pi-integration-copy" rsync -a --delete -e "ssh -p ${PI_SSH_PORT}" \
       "${INSTALL_DIR}/" "${PI_SSH}:${PI_INTEGRATION_DIR}/"
   else
-    run_logged "pi-integration-copy" bash -lc "
+    run_logged "pi-integration-copy" bash -c "
       set -e
       scp -P '${PI_SSH_PORT}' -r '${INSTALL_DIR}/.' '${PI_SSH}:${PI_INTEGRATION_DIR}/'
     "
@@ -1505,7 +1585,7 @@ tier_report() {
   need_paths
   mkdirp "${LOG_DIR}"
 
-  run_logged "report" bash -lc "
+  run_logged "report" bash -c "
     set -e
     echo 'Toolchain test script: ${SCRIPT_VERSION}'
     echo
@@ -1560,7 +1640,7 @@ tier_sanity() {
   mkdirp "${WORK_DIR}"
   write_sources
 
-  run_logged "provenance-gcc" bash -lc "
+  run_logged "provenance-gcc" bash -c "
     set -e
     '${TC_PREFIX}/bin/${TARGET}-gcc' -v 2>&1 | sed -n '/Configured with:/,/Thread model:/p'
     echo
@@ -1611,14 +1691,14 @@ tier_smoke() {
   run_logged "qemu-run-lto"     qemu_run "${WORK_DIR}/bin/lto_test"
 
   inspect_elf "${WORK_DIR}/bin/dso_catch"
-  run_logged "qemu-run-dso-catch" bash -lc "
+  run_logged "qemu-run-dso-catch" bash -c "
     set -e
     cd '${WORK_DIR}/bin'
     '${QEMU_AARCH64}' -L '${SYSROOT}' './dso_catch'
   "
 
   if [[ "${STRESS_DLOPEN_THREADS}" == "1" ]]; then
-    run_logged "qemu-run-dlopen-threads" bash -lc "
+    run_logged "qemu-run-dlopen-threads" bash -c "
       set -e
       cd '${WORK_DIR}/bin'
       '${QEMU_AARCH64}' -L '${SYSROOT}' './dlopen_threads' '${STRESS_DLOPEN_THREADS_N}' '${STRESS_DLOPEN_ITERS}' './libthrow.so'
@@ -1626,7 +1706,7 @@ tier_smoke() {
   fi
 
   if [[ "${STRESS_RTLD_COLLISION}" == "1" ]]; then
-    run_logged "qemu-run-rtld-collision" bash -lc "
+    run_logged "qemu-run-rtld-collision" bash -c "
       set -e
       cd '${WORK_DIR}/bin'
       '${QEMU_AARCH64}' -L '${SYSROOT}' './rtld_collision'
@@ -1657,7 +1737,7 @@ tier_nightly() {
   run_logged "pi-prepare" remote_reset_dir "PI_TMPDIR" "${PI_TMPDIR}"
 
   # Copy bins + required DSOs
-  run_logged "pi-copy-bins" bash -lc "
+  run_logged "pi-copy-bins" bash -c "
     set -e
     scp -P '${PI_SSH_PORT}' '${WORK_DIR}/bin/'* '${PI_SSH}:${PI_TMPDIR}/'
     scp -P '${PI_SSH_PORT}' '${WORK_DIR}/lib/libthrow.so' '${PI_SSH}:${PI_TMPDIR}/'
@@ -1757,7 +1837,8 @@ Integration:
   INTEGRATION_RUN_ON_PI=1
   PI_NET_TEST=1
   PI_NET_TEST_URL=https://example.com
-  PI_TLS_SELFCONTAINED=1    (stages sysroot CA bundle + uses CURL_CA_BUNDLE on Pi)
+  PI_TLS_SELFCONTAINED=1    (stages CA bundle + uses CURL_CA_BUNDLE on Pi)
+  TLS_CA_BUNDLE=            (optional explicit staged CA bundle source)
   VERIFY_INTEGRATION_DOWNLOADS=1
   VERIFY_INTEGRATION_GPG=1  (requires trusted upstream signing keys; set 0 only for bootstrap/debug)
   ZLIB_SHA256=...
