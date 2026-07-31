@@ -75,6 +75,12 @@ Check the host first:
 ./build-musl-cross-toolchain.sh verify-host
 ```
 
+Optionally check whether the pinned musl release is still current:
+
+```sh
+./build-musl-cross-toolchain.sh check-updates
+```
+
 Build the production dynamic-capable musl toolchain:
 
 ```sh

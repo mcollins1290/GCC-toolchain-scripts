@@ -104,6 +104,7 @@ MUSL_SIG_URL="${MUSL_SIG_URL:-${MUSL_URL}.asc}"
 MUSL_SHA256="${MUSL_SHA256:-d585fd3b613c66151fc3249e8ed44f77020cb5e6c1e635a616d3f9f82460512a}"
 MUSL_SRC_DIR="${MUSL_SRC_DIR:-${SRC_ROOT}/musl-${MUSL_VER}}"
 MUSL_BUILD_DIR="${MUSL_BUILD_DIR:-${BUILD_DIR}/musl}"
+MUSL_RELEASES_URL="${MUSL_RELEASES_URL:-https://musl.libc.org/releases.html}"
 
 # Upstream fix for CVE-2026-6042. The qsort fix for CVE-2026-40200 is
 # 32-bit-only and does not affect this aarch64 toolchain.
@@ -283,6 +284,70 @@ download_file() {
   else
     die "need curl or wget to download: $url"
   fi
+}
+
+fetch_url_stdout() {
+  local url="$1"
+
+  if have_cmd curl; then
+    curl -fsSL "${url}"
+  elif have_cmd wget; then
+    wget -qO- "${url}"
+  else
+    return 127
+  fi
+}
+
+latest_musl_release() {
+  local release_index latest
+
+  release_index="$(fetch_url_stdout "${MUSL_RELEASES_URL}")" || return 1
+  latest="$(
+    printf '%s\n' "${release_index}" |
+      grep -Eo 'musl-[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz' |
+      sed -E 's/^musl-//; s/\.tar\.gz$//' |
+      sort -Vu |
+      tail -n 1
+  )"
+
+  [[ -n "${latest}" ]] || return 1
+  printf '%s\n' "${latest}"
+}
+
+version_compare() {
+  local lhs="$1" rhs="$2"
+
+  if [[ "${lhs}" == "${rhs}" ]]; then
+    printf '= '
+  elif [[ "$(printf '%s\n%s\n' "${lhs}" "${rhs}" | sort -V | tail -n 1)" == "${lhs}" ]]; then
+    printf '> '
+  else
+    printf '< '
+  fi
+}
+
+check_musl_updates() {
+  local latest relation
+
+  latest="$(latest_musl_release)" || {
+    echo "could not determine latest musl release from ${MUSL_RELEASES_URL}" >&2
+    return 1
+  }
+  relation="$(version_compare "${MUSL_VER}" "${latest}")"
+
+  echo "configured musl: ${MUSL_VER}"
+  echo "latest musl:     ${latest}"
+  case "${relation}" in
+    "= ") echo "status:          current" ;;
+    "< ") echo "status:          update available" ;;
+    "> ") echo "status:          configured version is newer than latest official release" ;;
+  esac
+  echo
+  echo "note: this check is advisory only; builds remain pinned to MUSL_VER and MUSL_SHA256."
+}
+
+check_musl_updates_command() {
+  check_musl_updates || die "musl update check failed"
 }
 
 verify_sha256() {
@@ -604,6 +669,14 @@ verify_host() {
   echo "  SOURCE_REFRESH=${SOURCE_REFRESH}"
   echo "  VERIFY_GPG=${VERIFY_GPG}"
   echo "  BUILD_TRIPLET=${BUILD_TRIPLET:-$(build_triplet)}"
+
+  echo
+  echo "==> musl release check"
+  if check_musl_updates; then
+    :
+  else
+    echo "  WARN musl update check failed; continuing because verify-host treats it as advisory"
+  fi
 
   [[ "${missing}" == "0" ]] || die "host verification failed"
   echo "==> verify-host: PASS"
@@ -1111,6 +1184,7 @@ Usage: $0 <command>
 
 Commands:
   verify-host  Check host tools, libraries, GPG/download tools, and settings
+  check-updates Check official musl releases and report whether MUSL_VER is current
   fetch-hashes Download source archives and print candidate SHA256 values
   binutils   Download/extract (if needed) + build+install cross binutils into PREFIX
   headers    Download/extract (if needed) + install linux headers into SYSROOT
@@ -1139,6 +1213,7 @@ Env toggles:
   GCC_GPG_PRIMARY_FPR=         Expected GCC signing primary fingerprint
   BINUTILS_GPG_PRIMARY_FPR=    Expected binutils signing primary fingerprint
   MUSL_GPG_PRIMARY_FPR=        Expected musl signing primary fingerprint
+  MUSL_RELEASES_URL=           Official musl release index (default: ${MUSL_RELEASES_URL})
   BUILD_TRIPLET=               Override detected build triplet
   HOST_TRIPLET=                Override host triplet for generated tools
 
@@ -1160,6 +1235,7 @@ main() {
   local cmd="${1:-}"
   case "${cmd}" in
     verify-host) verify_host ;;
+    check-updates) check_musl_updates_command ;;
     fetch-hashes) print_source_hashes ;;
     binutils) validate_settings; reset_logs_for_run; build_binutils ;;
     headers)  validate_settings; reset_logs_for_run; install_linux_headers ;;
