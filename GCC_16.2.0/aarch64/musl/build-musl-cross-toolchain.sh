@@ -105,6 +105,11 @@ MUSL_SHA256="${MUSL_SHA256:-d585fd3b613c66151fc3249e8ed44f77020cb5e6c1e635a616d3
 MUSL_SRC_DIR="${MUSL_SRC_DIR:-${SRC_ROOT}/musl-${MUSL_VER}}"
 MUSL_BUILD_DIR="${MUSL_BUILD_DIR:-${BUILD_DIR}/musl}"
 MUSL_RELEASES_URL="${MUSL_RELEASES_URL:-https://musl.libc.org/releases.html}"
+MUSL_RELEASES_FALLBACK_URL="${MUSL_RELEASES_FALLBACK_URL:-https://musl.libc.org/releases/}"
+MUSL_UPDATE_CONNECT_TIMEOUT="${MUSL_UPDATE_CONNECT_TIMEOUT:-6}"
+MUSL_UPDATE_MAX_TIME="${MUSL_UPDATE_MAX_TIME:-20}"
+MUSL_UPDATE_RETRIES="${MUSL_UPDATE_RETRIES:-1}"
+MUSL_UPDATE_STRICT="${MUSL_UPDATE_STRICT:-0}"
 
 # Upstream fix for CVE-2026-6042. The qsort fix for CVE-2026-40200 is
 # 32-bit-only and does not affect this aarch64 toolchain.
@@ -151,6 +156,13 @@ validate_core_settings() {
   [[ -n "${TARGET}" ]] || die "TARGET must not be empty"
   [[ -n "${PREFIX}" && "${PREFIX}" != "/" ]] || die "refusing dangerous PREFIX='${PREFIX}'"
   [[ -n "${SYSROOT}" && "${SYSROOT}" != "/" ]] || die "refusing dangerous SYSROOT='${SYSROOT}'"
+}
+
+validate_positive_integer() {
+  local name="$1"
+  local value="$2"
+
+  [[ "${value}" =~ ^[0-9]+$ && "${value}" -gt 0 ]] || die "${name} must be a positive integer"
 }
 
 validate_settings() {
@@ -200,6 +212,16 @@ validate_settings() {
   if [[ "${SOURCE_REFRESH}" == "1" && "${RECONFIGURE}" == "0" ]]; then
     die "SOURCE_REFRESH=1 requires RECONFIGURE=1 so build directories cannot point at stale source trees"
   fi
+}
+
+validate_update_check_settings() {
+  validate_positive_integer "MUSL_UPDATE_CONNECT_TIMEOUT" "${MUSL_UPDATE_CONNECT_TIMEOUT}"
+  validate_positive_integer "MUSL_UPDATE_MAX_TIME" "${MUSL_UPDATE_MAX_TIME}"
+  validate_positive_integer "MUSL_UPDATE_RETRIES" "${MUSL_UPDATE_RETRIES}"
+  case "${MUSL_UPDATE_STRICT}" in
+    0|1) ;;
+    *) die "MUSL_UPDATE_STRICT must be 0 or 1" ;;
+  esac
 }
 
 distclean_remove_path() {
@@ -290,28 +312,62 @@ fetch_url_stdout() {
   local url="$1"
 
   if have_cmd curl; then
-    curl -fsSL "${url}"
-  elif have_cmd wget; then
-    wget -qO- "${url}"
-  else
-    return 127
+    # musl.libc.org occasionally resets or stalls TLS handshakes. Keep this
+    # helper resilient because update checks are advisory and should not be
+    # more brittle than the actual pinned-source build path.
+    curl --http1.1 -fsSL \
+      --ipv4 \
+      --connect-timeout "${MUSL_UPDATE_CONNECT_TIMEOUT}" \
+      --max-time "${MUSL_UPDATE_MAX_TIME}" \
+      --retry "${MUSL_UPDATE_RETRIES}" \
+      --retry-delay 2 \
+      --retry-all-errors \
+      --user-agent "gcc-rpi4b-toolchain/${SCRIPT_VERSION}" \
+      "${url}" 2>/dev/null && return 0
   fi
+
+  if have_cmd wget; then
+    wget -qO- \
+      --inet4-only \
+      --timeout="${MUSL_UPDATE_CONNECT_TIMEOUT}" \
+      --tries="$((MUSL_UPDATE_RETRIES + 1))" \
+      --user-agent="gcc-rpi4b-toolchain/${SCRIPT_VERSION}" \
+      "${url}" 2>/dev/null && return 0
+  fi
+
+  return 1
 }
 
 latest_musl_release() {
-  local release_index latest
+  local release_index latest url
+  local -a urls=("${MUSL_RELEASES_URL}")
 
-  release_index="$(fetch_url_stdout "${MUSL_RELEASES_URL}")" || return 1
-  latest="$(
-    printf '%s\n' "${release_index}" |
-      grep -Eo 'musl-[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz' |
-      sed -E 's/^musl-//; s/\.tar\.gz$//' |
-      sort -Vu |
-      tail -n 1
-  )"
+  if [[ -n "${MUSL_RELEASES_FALLBACK_URL}" && "${MUSL_RELEASES_FALLBACK_URL}" != "${MUSL_RELEASES_URL}" ]]; then
+    urls+=("${MUSL_RELEASES_FALLBACK_URL}")
+  fi
 
-  [[ -n "${latest}" ]] || return 1
-  printf '%s\n' "${latest}"
+  for url in "${urls[@]}"; do
+    release_index="$(fetch_url_stdout "${url}")" || {
+      echo "warning: could not fetch musl release index: ${url}" >&2
+      continue
+    }
+    latest="$(
+      printf '%s\n' "${release_index}" |
+        grep -Eo 'musl-[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz' |
+        sed -E 's/^musl-//; s/\.tar\.gz$//' |
+        sort -Vu |
+        tail -n 1
+    )"
+
+    if [[ -n "${latest}" ]]; then
+      printf '%s\n' "${latest}"
+      return 0
+    fi
+
+    echo "warning: no musl release tarballs found in index: ${url}" >&2
+  done
+
+  return 1
 }
 
 version_compare() {
@@ -329,10 +385,7 @@ version_compare() {
 check_musl_updates() {
   local latest relation
 
-  latest="$(latest_musl_release)" || {
-    echo "could not determine latest musl release from ${MUSL_RELEASES_URL}" >&2
-    return 1
-  }
+  latest="$(latest_musl_release)" || return 1
   relation="$(version_compare "${MUSL_VER}" "${latest}")"
 
   echo "configured musl: ${MUSL_VER}"
@@ -347,7 +400,16 @@ check_musl_updates() {
 }
 
 check_musl_updates_command() {
-  check_musl_updates || die "musl update check failed"
+  validate_update_check_settings
+  if ! check_musl_updates; then
+    echo "configured musl: ${MUSL_VER}"
+    echo "latest musl:     unknown"
+    echo "status:          unknown (could not fetch official musl release index)"
+    echo
+    echo "note: this check is advisory only; builds remain pinned to MUSL_VER and MUSL_SHA256."
+    echo "note: set MUSL_UPDATE_STRICT=1 if release-index lookup failure should fail this command."
+    [[ "${MUSL_UPDATE_STRICT}" == "0" ]] || die "musl update check failed"
+  fi
 }
 
 verify_sha256() {
@@ -1214,6 +1276,11 @@ Env toggles:
   BINUTILS_GPG_PRIMARY_FPR=    Expected binutils signing primary fingerprint
   MUSL_GPG_PRIMARY_FPR=        Expected musl signing primary fingerprint
   MUSL_RELEASES_URL=           Official musl release index (default: ${MUSL_RELEASES_URL})
+  MUSL_RELEASES_FALLBACK_URL=  Fallback musl release index (default: ${MUSL_RELEASES_FALLBACK_URL})
+  MUSL_UPDATE_CONNECT_TIMEOUT= Update-check connect timeout seconds (default: ${MUSL_UPDATE_CONNECT_TIMEOUT})
+  MUSL_UPDATE_MAX_TIME=        Update-check total time per URL seconds (default: ${MUSL_UPDATE_MAX_TIME})
+  MUSL_UPDATE_RETRIES=         Update-check retries per URL (default: ${MUSL_UPDATE_RETRIES})
+  MUSL_UPDATE_STRICT=          Fail check-updates on release-index lookup failure (default: ${MUSL_UPDATE_STRICT})
   BUILD_TRIPLET=               Override detected build triplet
   HOST_TRIPLET=                Override host triplet for generated tools
 
