@@ -21,7 +21,7 @@ SYSROOT="${SYSROOT:-/build-rpi/rpi/sysroot}"
 
 QEMU_AARCH64="${QEMU_AARCH64:-qemu-aarch64}"
 
-PI_SSH="${PI_SSH:-root@raspberrypi2.totten}"
+PI_SSH="${PI_SSH:-root@mc-rpi2.duckdns.org}"
 PI_SSH_PORT="${PI_SSH_PORT:-22}"
 PI_TMPDIR="${PI_TMPDIR:-/tmp/gcc-toolchain-tests}"
 
