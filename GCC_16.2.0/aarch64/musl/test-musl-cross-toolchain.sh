@@ -35,7 +35,7 @@ LINK_MODE="${LINK_MODE:-auto}"
 
 QEMU_AARCH64="${QEMU_AARCH64:-qemu-aarch64}"
 
-PI_SSH="${PI_SSH:-root@raspberrypi2.totten}"
+PI_SSH="${PI_SSH:-root@mc-rpi2.duckdns.org}"
 PI_SSH_PORT="${PI_SSH_PORT:-22}"
 PI_TMPDIR="${PI_TMPDIR:-/tmp/gcc-toolchain-tests}"
 
@@ -69,8 +69,9 @@ STRESS_STRIP_VERIFY="${STRESS_STRIP_VERIFY:-1}"     # ensure strip doesn't break
 STRESS_LIBSTDCPP_ABI="${STRESS_LIBSTDCPP_ABI:-1}"   # small C++ ABI sanity (dynamic+static ok)
 
 ZLIB_VER="${ZLIB_VER:-1.3.2}"
-ZLIB_URL="${ZLIB_URL:-https://zlib.net/zlib-${ZLIB_VER}.tar.gz}"
-ZLIB_SIG_URL="${ZLIB_SIG_URL:-${ZLIB_URL}.asc}"
+# Archived releases retain tarballs on zlib.net, but signatures on GitHub.
+ZLIB_URL="${ZLIB_URL:-https://zlib.net/fossils/zlib-${ZLIB_VER}.tar.gz}"
+ZLIB_SIG_URL="${ZLIB_SIG_URL:-https://github.com/madler/zlib/releases/download/v${ZLIB_VER}/zlib-${ZLIB_VER}.tar.gz.asc}"
 ZLIB_SHA256="${ZLIB_SHA256:-bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16}"
 ZLIB_GPG_FPR="${ZLIB_GPG_FPR:-5ED46A6721D365587791E2AA783FCD8E58BCAFBA}"
 
@@ -2049,6 +2050,51 @@ tier_report() {
   tier_summary
 }
 
+assert_musl_regex_fix() {
+  local expected=7813e9119eb5fe681b6750b8a033a0490bca0941
+  [[ "$(manifest_value musl_regex_patch_commit)" == "${expected}" ]] \
+    || die "missing expected musl CVE-2026-107891 patch provenance; rebuild musl and refresh the manifest"
+  command -v timeout >/dev/null 2>&1 || die "regex regression requires timeout"
+  mkdirp "${WORK_DIR}/src" "${WORK_DIR}/bin"
+  cat > "${WORK_DIR}/src/regex_security.c" <<'EOF'
+#include <regex.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int main(void) {
+  regex_t re;
+  if (regcomp(&re, "^(ab)+$", REG_EXTENDED)) return 1;
+  int matched = regexec(&re, "abab", 0, NULL, 0);
+  int rejected = regexec(&re, "abc", 0, NULL, 0);
+  regfree(&re);
+  if (matched || rejected != REG_NOMATCH) return 2;
+  /* The backport rejects oversized input before constructing the regex AST. */
+  size_t n = 1024000;
+  char *pattern = malloc(n + 1);
+  if (!pattern) return 3;
+  memset(pattern, 'a', n);
+  pattern[n] = 0;
+  int rc = regcomp(&re, pattern, REG_EXTENDED);
+  free(pattern);
+  if (!rc) regfree(&re);
+  if (rc != REG_ESPACE) return 4;
+  puts("regex security regression: PASS");
+  return 0;
+}
+EOF
+  local mode
+  for mode in static dynamic; do
+    [[ "${mode}" != dynamic || "${LINK_MODE}" != static ]] || continue
+    local -a flags=(-static)
+    if [[ "${mode}" == dynamic ]]; then flags=(); fi
+    run_logged "regex-security-build-${mode}" tc gcc --sysroot="${SYSROOT}" \
+      -O2 -Wall -Wextra -Werror "${flags[@]}" "${WORK_DIR}/src/regex_security.c" \
+      -o "${WORK_DIR}/bin/regex_security_${mode}"
+    run_logged "regex-security-run-${mode}" timeout 15 \
+      "${QEMU_AARCH64}" -L "${SYSROOT}" "${WORK_DIR}/bin/regex_security_${mode}"
+  done
+}
+
 tier_sanity() {
   EXIT_CLEANUP_ENABLED=1
   mark_tier_start "sanity"
@@ -2056,6 +2102,8 @@ tier_sanity() {
   need_qemu
   mkdirp "${WORK_DIR}"
   write_sources
+
+  assert_musl_regex_fix
 
   run_logged "provenance-gcc" bash -c "
     set -e

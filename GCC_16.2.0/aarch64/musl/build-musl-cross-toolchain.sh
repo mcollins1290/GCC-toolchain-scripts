@@ -118,6 +118,12 @@ MUSL_ICONV_PATCH_URL="${MUSL_ICONV_PATCH_URL:-https://git.musl-libc.org/cgit/mus
 MUSL_ICONV_PATCH_FILE="${MUSL_ICONV_PATCH_FILE:-${TARBALL_DIR}/musl-${MUSL_ICONV_PATCH_COMMIT}.patch}"
 MUSL_ICONV_PATCH_SHA256="${MUSL_ICONV_PATCH_SHA256:-1d0be2e72b9d5bd16546b923aa8af861d271322f01644716a81823bec4065c99}"
 
+# Maintainer's CVE-2026-107891 backport for musl 1.2.6.
+MUSL_REGEX_PATCH_COMMIT="7813e9119eb5fe681b6750b8a033a0490bca0941"
+MUSL_REGEX_PATCH_URL="https://www.openwall.com/lists/musl/2026/10/21/1/1"
+MUSL_REGEX_PATCH_FILE="${TARBALL_DIR}/musl-${MUSL_REGEX_PATCH_COMMIT}.patch"
+MUSL_REGEX_PATCH_SHA256="0cf0090ab433e8f9ed08ae03a0c93aff557c1d3e347260f62a61a10281f5333b"
+
 # ------------------------------ Helpers ---------------------------------------
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 mkdirp() { mkdir -p "$@"; }
@@ -560,6 +566,17 @@ ensure_musl_source() {
     ( cd "${MUSL_SRC_DIR}" && patch -p1 < "${MUSL_ICONV_PATCH_FILE}" )
     touch "${marker}"
   fi
+  marker="${MUSL_SRC_DIR}/.patched-${MUSL_REGEX_PATCH_COMMIT}"
+  if [[ ! -f "${marker}" ]]; then
+    have_cmd patch || die "missing patch utility"
+    download_file "${MUSL_REGEX_PATCH_URL}" "${MUSL_REGEX_PATCH_FILE}"
+    verify_sha256 "${MUSL_REGEX_PATCH_FILE}" "${MUSL_REGEX_PATCH_SHA256}"
+    grep -q "From ${MUSL_REGEX_PATCH_COMMIT} " "${MUSL_REGEX_PATCH_FILE}" \
+      || die "musl regex patch does not identify expected commit ${MUSL_REGEX_PATCH_COMMIT}"
+    echo "==> musl: applying CVE-2026-107891 fix ${MUSL_REGEX_PATCH_COMMIT}"
+    ( cd "${MUSL_SRC_DIR}" && patch --batch --fuzz=0 -p1 < "${MUSL_REGEX_PATCH_FILE}" )
+    touch "${marker}"
+  fi
 }
 
 print_source_hashes() {
@@ -575,6 +592,7 @@ print_source_hashes() {
   download_file "${LINUX_URL}" "${linux_tb}"
   download_file "${MUSL_URL}" "${musl_tb}"
   download_file "${MUSL_ICONV_PATCH_URL}" "${MUSL_ICONV_PATCH_FILE}"
+  download_file "${MUSL_REGEX_PATCH_URL}" "${MUSL_REGEX_PATCH_FILE}"
 
   echo
   echo "Candidate hashes; verify these against upstream signatures before pinning:"
@@ -583,7 +601,8 @@ print_source_hashes() {
     "${binutils_tb}" \
     "${linux_tb}" \
     "${musl_tb}" \
-    "${MUSL_ICONV_PATCH_FILE}"
+    "${MUSL_ICONV_PATCH_FILE}" \
+    "${MUSL_REGEX_PATCH_FILE}"
 }
 
 # ------------------------------ Env ------------------------------------------
@@ -853,6 +872,8 @@ write_manifest() {
     echo "musl_sha256=${MUSL_SHA256}"
     echo "musl_patch_commit=${MUSL_ICONV_PATCH_COMMIT}"
     echo "musl_patch_sha256=${MUSL_ICONV_PATCH_SHA256}"
+    echo "musl_regex_patch_commit=${MUSL_REGEX_PATCH_COMMIT}"
+    echo "musl_regex_patch_sha256=${MUSL_REGEX_PATCH_SHA256}"
     echo "target_arch_base=${TARGET_ARCH_BASE}"
     echo "target_tune=${TARGET_TUNE}"
     echo "enable_dynamic=${ENABLE_DYNAMIC}"
@@ -1307,7 +1328,7 @@ main() {
     binutils) validate_settings; reset_logs_for_run; build_binutils ;;
     headers)  validate_settings; reset_logs_for_run; install_linux_headers ;;
     stage1)   validate_settings; reset_logs_for_run; build_gcc_stage1 ;;
-    musl)     validate_settings; reset_logs_for_run; build_musl ;;
+    musl)     validate_settings; reset_logs_for_run; build_musl; write_manifest ;;
     gcc)      validate_settings; reset_logs_for_run; build_gcc_final ;;
     build)    validate_settings; reset_logs_for_run; build_all ;;
     pkg-config-wrapper) install_pkg_config_wrapper_command ;;
